@@ -263,6 +263,102 @@ PROVIDER_FUNCTIONS = {
 }
 
 
+# ═══════════════════════════════════════════════════════
+# FIX 2 — ADVERSARIAL ROLE ASSIGNMENT
+# Each model gets a different analytical lens
+# ═══════════════════════════════════════════════════════
+
+AGENT_ROLES = {
+    0: ("SKEPTIC", "Find reasons this will FAIL. Poke holes in the data. Consensus is your enemy — disagree if the evidence is thin."),
+    1: ("BULL", "Find the strongest case FOR this opportunity. Steelman it. Look for hidden demand signals others miss."),
+    2: ("MARKET_ANALYST", "Ignore hype. Focus strictly on: total addressable market, competition density, willingness-to-pay evidence, and switching costs."),
+    3: ("TIMING_ANALYST", "Is this too early, too late, or perfect timing? Focus on trend velocity, adoption curves, and technology readiness."),
+    4: ("ICP_ANALYST", "Who exactly pays for this? Define the ideal customer profile so precisely you could write a cold email to them right now."),
+}
+
+# ═══════════════════════════════════════════════════════
+# FIX 3 — CALIBRATION BLOCK
+# Ensures scores mean the same thing across all models
+# ═══════════════════════════════════════════════════════
+
+CALIBRATION_BLOCK = """
+
+SCORE CALIBRATION (mandatory — use this scale):
+- 85-100: Clear willingness-to-pay, growing market, weak competition. BUILD immediately.
+- 65-84: Strong signal but 1-2 major unknowns remain. EXPLORE further.
+- 45-64: Interesting pattern but insufficient evidence. MONITOR only.
+- 25-44: Weak signal. Pain exists but WTP unclear or market saturated. SKIP.
+- 0-24: INSUFFICIENT DATA or declining market. Output verdict DONT_BUILD.
+
+ANTI-SYCOPHANCY RULES:
+- If fewer than 10 posts mention this topic → output "INSUFFICIENT_DATA" as verdict
+- Never invent market size numbers — say "unknown" if not in the data
+- You MUST include a "top_unknowns" field: list your TOP 3 UNKNOWNS — things that would change your verdict if known
+- Your confidence MUST be below 50 if you have more than 2 unknowns
+- Do NOT agree with other models just to be agreeable. Disagree if the evidence supports it.
+"""
+
+
+def get_role_system_prompt(agent_index, base_prompt):
+    """Inject adversarial role + calibration into each agent's system prompt."""
+    role_name, role_instruction = AGENT_ROLES.get(agent_index % len(AGENT_ROLES), ("ANALYST", "Provide balanced analysis."))
+    return f"{base_prompt}\n\nYOUR ROLE: {role_name}\n{role_instruction}{CALIBRATION_BLOCK}"
+
+
+# ═══════════════════════════════════════════════════════
+# FIX 1 — ANCHORING CASCADE PREVENTION
+# Strip scores before showing analyses to peers in debate
+# ═══════════════════════════════════════════════════════
+
+def sanitize_for_debate(analysis_result):
+    """Remove scores/verdicts to prevent anchoring. Only show reasoning + evidence."""
+    return {
+        "top_evidence": analysis_result.get("evidence", [])[:5],
+        "top_unknowns": analysis_result.get("top_unknowns", []),
+        "key_reasoning": (
+            analysis_result.get("executive_summary", "")
+            or analysis_result.get("summary", "")
+        )[:500],
+        "risk_factors": analysis_result.get("risk_factors", [])[:3],
+        "price_signals": analysis_result.get("price_signals", "")[:300],
+        # NO confidence score, NO verdict — prevents anchoring
+    }
+
+
+# ═══════════════════════════════════════════════════════
+# FIX 4 — BASE RATE CONTEXT BUILDER
+# ═══════════════════════════════════════════════════════
+
+def build_data_context(posts, metadata=None):
+    """Build base-rate context block that gets prepended to analysis prompts."""
+    metadata = metadata or {}
+    total_scraped = metadata.get("total_scraped", 0)
+    match_count = len(posts) if isinstance(posts, list) else 0
+
+    if total_scraped > 0 and match_count > 0:
+        match_rate = match_count / total_scraped * 100
+        signal_strength = (
+            "STRONG signal (>5% match rate) — this topic has real traction"
+            if match_rate > 5
+            else "MODERATE signal (1-5% match rate) — promising but verify"
+            if match_rate > 1
+            else "WEAK signal (<1% match rate) — be very conservative in your assessment"
+        )
+    else:
+        match_rate = 0
+        signal_strength = "UNKNOWN signal strength — base rate data unavailable"
+
+    return f"""DATA CONTEXT (read before analyzing):
+- Total posts scraped this run: {total_scraped or 'unknown'}
+- Posts matching this topic: {match_count}
+- Match rate: {match_rate:.1f}%
+- Signal assessment: {signal_strength}
+- Time range: {metadata.get('date_range', 'unknown')}
+- Platforms: {metadata.get('platforms', 'unknown')}
+
+"""
+
+
 def call_provider(config, prompt, system_prompt):
     """Call a specific provider using its config. Returns (provider_name, model, response_text)."""
     provider = config["provider"]
@@ -332,41 +428,69 @@ class AIBrain:
         print(f"  [Brain] Single call #{self._call_counter} → {provider}/{model} (agent {idx+1}/{len(self.configs)}, {len(text)} chars)")
         return text
 
-    def debate(self, prompt, system_prompt, on_progress=None):
+    def debate(self, prompt, system_prompt, on_progress=None, metadata=None):
         """
-        Full debate pipeline:
-        1. All models analyze independently (parallel)
-        2. If only 1 model → return its analysis directly
-        3. If 2-3 models → check for disagreements → debate → synthesize
+        Full 3-round debate pipeline (v2 — Opus-audited):
+        1. All models analyze independently with adversarial roles (parallel)
+        2. If verdicts disagree → debate with sanitized peer reasoning + non-LLM signals
+        3. Weighted consensus (penalizes overconfidence)
         """
         n = len(self.configs)
+        metadata = metadata or {}
 
-        # ── Step 1: Independent analysis ──
-        print(f"\n  [Brain] ══ ROUND 1: Independent Analysis ({n} models) ══")
+        # ══ ROUND 1: Independent Analysis with Adversarial Roles ══
+        print(f"\n  [Brain] ══ ROUND 1: Independent Analysis ({n} models, adversarial roles) ══")
         if on_progress:
             on_progress("debating", f"Round 1: {n} models analyzing independently")
 
         analyses = []
 
-        def _analyze(config):
+        def _analyze(config, agent_index):
+            # FIX 2: Each agent gets a unique role + FIX 3: Calibration
+            role_prompt = get_role_system_prompt(agent_index, system_prompt)
+            role_name = AGENT_ROLES.get(agent_index % len(AGENT_ROLES), ("ANALYST",))[0]
+
+            # FIX 4: Inject base rate context into prompt
+            contextualized_prompt = prompt
+            if metadata:
+                context_block = build_data_context(metadata.get("posts", []), metadata)
+                contextualized_prompt = context_block + prompt
+
             try:
-                provider, model, text = call_provider(config, prompt, system_prompt)
+                provider, model, text = call_provider(config, contextualized_prompt, role_prompt)
                 result = extract_json(text)
-                return {"config_id": config["id"], "provider": provider, "model": model, "result": result, "raw": text, "error": None}
+                # Ensure top_unknowns exists for weighted consensus
+                if "top_unknowns" not in result:
+                    result["top_unknowns"] = []
+                return {
+                    "config_id": config["id"], "provider": provider, "model": model,
+                    "result": result, "raw": text, "error": None,
+                    "role": role_name, "agent_index": agent_index,
+                }
             except Exception as e:
-                return {"config_id": config["id"], "provider": config["provider"], "model": config["selected_model"], "result": None, "raw": "", "error": str(e)}
+                return {
+                    "config_id": config["id"], "provider": config["provider"],
+                    "model": config["selected_model"], "result": None, "raw": "",
+                    "error": str(e), "role": role_name, "agent_index": agent_index,
+                }
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {executor.submit(_analyze, c): c for c in self.configs}
+            futures = {
+                executor.submit(_analyze, c, i): c
+                for i, c in enumerate(self.configs)
+            }
             for future in concurrent.futures.as_completed(futures):
                 analysis = future.result()
                 if analysis["error"]:
-                    print(f"  [Brain] ✗ {analysis['provider']}/{analysis['model']}: {analysis['error']}")
+                    print(f"  [Brain] ✗ {analysis['provider']}/{analysis['model']} [{analysis['role']}]: {analysis['error']}")
                 else:
-                    print(f"  [Brain] ✓ {analysis['provider']}/{analysis['model']}: verdict={analysis['result'].get('verdict', '?')}")
+                    unknowns = len(analysis["result"].get("top_unknowns", []))
+                    print(f"  [Brain] ✓ {analysis['provider']}/{analysis['model']} [{analysis['role']}]: "
+                          f"verdict={analysis['result'].get('verdict', '?')} "
+                          f"conf={analysis['result'].get('confidence', '?')} "
+                          f"unknowns={unknowns}")
                 analyses.append(analysis)
 
-        # Filter successful analyses
         valid = [a for a in analyses if a["result"] is not None]
 
         if len(valid) == 0:
@@ -376,132 +500,189 @@ class AIBrain:
             print(f"  [Brain] Only 1 model succeeded → returning its analysis directly")
             return valid[0]["result"]
 
-        # ── Step 2: Check for disagreements ──
+        # ── Check for disagreements ──
         verdicts = [a["result"].get("verdict", "UNKNOWN") for a in valid]
         unique_verdicts = set(verdicts)
-        print(f"\n  [Brain] Verdicts: {verdicts}")
+        print(f"\n  [Brain] Verdicts: {verdicts} (roles: {[a['role'] for a in valid]})")
 
         if len(unique_verdicts) == 1:
-            # All agree → merge and return
             print(f"  [Brain] ══ CONSENSUS: All models agree on '{verdicts[0]}' ══")
-            return self._merge_analyses(valid)
+            return self._weighted_merge(valid)
 
-        # ── Step 3: Debate round ──
-        print(f"\n  [Brain] ══ ROUND 2: Debate (models disagree!) ══")
+        # ══ ROUND 2: Debate with Sanitized Reasoning + Non-LLM Data ══
+        print(f"\n  [Brain] ══ ROUND 2: Debate (models disagree — scores hidden from peers) ══")
         if on_progress:
-            on_progress("debating", "Round 2: Models disagree — debate in progress")
+            on_progress("debating", "Round 2: Models debating with hidden scores")
 
-        debate_prompt_template = """Your colleague AI models analyzed the SAME data and reached DIFFERENT conclusions.
+        # FIX 6: Gather non-LLM signals if available
+        non_llm_block = ""
+        if metadata:
+            trends = metadata.get("trends_data", {})
+            competition = metadata.get("competition_data", {})
+            if trends or competition:
+                non_llm_block = f"""\n\nINDEPENDENT DATA (not from any AI model — weight this heavily):
+Google Trends velocity: {trends.get('trend_direction', 'unknown')} ({trends.get('growth_rate', 'unknown')}% change last 90 days)
+Competition density: {competition.get('saturation_tier', 'unknown')}
+Competitor count found: {competition.get('product_count', 'unknown')}
+Strongest competitor: {competition.get('top_competitor', 'unknown')}
+Stack Overflow activity: {trends.get('so_unanswered', 'unknown')} unanswered questions
+GitHub interest: {trends.get('gh_reactions', 'unknown')} issue reactions
+"""
 
-YOUR ORIGINAL ANALYSIS:
+        debate_prompt_template = """Multiple AI models analyzed the SAME data independently and reached DIFFERENT conclusions.
+
+YOUR ORIGINAL ANALYSIS (for your reference only):
 {own_analysis}
 
-OTHER MODELS' ANALYSES:
-{other_analyses}
+OTHER MODELS' REASONING (scores and verdicts HIDDEN to prevent anchoring):
+{other_reasoning}
+{non_llm_data}
+Given this disagreement and the non-LLM data above, re-evaluate your position:
+1. HOLD your position if your evidence is stronger
+2. CHANGE your verdict if a colleague raised a point you genuinely missed
 
-Given this disagreement, reconsider your verdict. You may:
-1. HOLD your position if you believe your evidence is stronger
-2. CHANGE your verdict if a colleague raised a point you missed
+Do NOT change your verdict just to agree. The non-LLM data above cannot lie — weight it heavily.
 
-Respond with the same JSON format as before, but add a "debate_note" field explaining why you held or changed your position."""
+Respond with the same JSON format. Add a "debate_note" field explaining why you held or changed."""
 
         debate_results = []
         for a in valid:
-            # Match by config_id, NOT provider name — critical for same-provider multi-agent
             others = [o for o in valid if o["config_id"] != a["config_id"]]
             if not others:
-                # Only one analysis (shouldn't happen if we got here, but safety)
-                debate_results.append({"provider": a["provider"], "model": a["model"], "result": a["result"]})
+                debate_results.append({"provider": a["provider"], "model": a["model"], "result": a["result"], "role": a["role"]})
                 continue
 
+            # FIX 1: Sanitize — only show reasoning + evidence, NOT scores/verdicts
             others_text = "\n\n".join([
-                f"=== {o['provider']}/{o['model']} (Verdict: {o['result'].get('verdict', '?')}) ===\n{json.dumps(o['result'], indent=2)}"
+                f"=== Model [{o['role']}] ===\n{json.dumps(sanitize_for_debate(o['result']), indent=2)}"
                 for o in others
             ])
 
             debate_prompt = debate_prompt_template.format(
                 own_analysis=json.dumps(a["result"], indent=2),
-                other_analyses=others_text,
+                other_reasoning=others_text,
+                non_llm_data=non_llm_block,
             )
 
             try:
-                # Find the EXACT config by id, not by provider name
                 config = next(c for c in self.configs if c["id"] == a["config_id"])
-                _, _, text = call_provider(config, debate_prompt, system_prompt)
+                # Keep the same role-specific system prompt
+                role_prompt = get_role_system_prompt(a["agent_index"], system_prompt)
+                _, _, text = call_provider(config, debate_prompt, role_prompt)
                 result = extract_json(text)
+                if "top_unknowns" not in result:
+                    result["top_unknowns"] = []
                 debate_results.append({
-                    "provider": a["provider"],
-                    "model": a["model"],
-                    "result": result,
+                    "provider": a["provider"], "model": a["model"],
+                    "result": result, "role": a["role"],
                     "debate_note": result.get("debate_note", ""),
                 })
-                print(f"  [Brain] Debate → {a['provider']}/{a['model']}: verdict={result.get('verdict', '?')} | note={result.get('debate_note', '')[:80]}")
+                action = "HELD" if result.get("verdict") == a["result"].get("verdict") else "CHANGED"
+                print(f"  [Brain] Debate → [{a['role']}] {a['provider']}/{a['model']}: {action} → verdict={result.get('verdict', '?')} | {result.get('debate_note', '')[:80]}")
             except Exception as e:
                 print(f"  [Brain] Debate failed for {a['provider']}/{a['model']}: {e}")
-                debate_results.append({"provider": a["provider"], "model": a["model"], "result": a["result"]})
+                debate_results.append({"provider": a["provider"], "model": a["model"], "result": a["result"], "role": a["role"]})
 
-        # ── Step 4: Final synthesis ──
-        print(f"\n  [Brain] ══ FINAL SYNTHESIS ══")
+        # ══ FINAL SYNTHESIS with Weighted Consensus ══
+        print(f"\n  [Brain] ══ FINAL SYNTHESIS (uncertainty-weighted) ══")
         if on_progress:
-            on_progress("synthesizing", "Synthesizing final report from debate results")
+            on_progress("synthesizing", "Synthesizing with uncertainty-weighted consensus")
 
-        return self._merge_analyses(
-            [{"provider": d["provider"], "model": d["model"], "result": d["result"]} for d in debate_results]
+        return self._weighted_merge(
+            [{"provider": d["provider"], "model": d["model"], "result": d["result"], "role": d.get("role", "ANALYST")} for d in debate_results]
         )
 
-    def _merge_analyses(self, analyses):
-        """Merge multiple model analyses into a single report with tiebreaker + dissent."""
-        verdicts = [a["result"].get("verdict", "UNKNOWN") for a in analyses]
-        confidences = [a["result"].get("confidence", 50) for a in analyses]
-
-        # ── Majority vote with explicit tiebreaker ──
+    def _weighted_merge(self, analyses):
+        """
+        FIX 5 — Uncertainty-Weighted Consensus.
+        Models that admitted more unknowns get LESS weight.
+        This rewards intellectual honesty over false confidence.
+        """
         from collections import Counter
-        verdict_counts = Counter(verdicts)
-        final_verdict = verdict_counts.most_common(1)[0][0]
-        majority_count = verdict_counts[final_verdict]
+
+        verdicts = [a["result"].get("verdict", "UNKNOWN") for a in analyses]
         total_models = len(analyses)
 
-        # ── Confidence: weighted by agreement strength ──
-        if majority_count == total_models:
-            # Unanimous — average confidence as-is
-            avg_confidence = int(sum(confidences) / len(confidences))
+        # ── Calculate per-model weights based on unknowns ──
+        weighted_entries = []
+        for a in analyses:
+            unknowns_count = len(a["result"].get("top_unknowns", []))
+            confidence = a["result"].get("confidence", 50)
+            # More unknowns = lower weight (inverse uncertainty)
+            weight = 1.0 / (1.0 + unknowns_count * 0.2)
+            weighted_entries.append({
+                "provider": a["provider"],
+                "model": a["model"],
+                "role": a.get("role", "ANALYST"),
+                "verdict": a["result"].get("verdict", "UNKNOWN"),
+                "confidence": confidence,
+                "weight": weight,
+                "unknowns": unknowns_count,
+                "result": a["result"],
+            })
+
+        # ── Weighted majority vote ──
+        verdict_weights = {}
+        for e in weighted_entries:
+            v = e["verdict"]
+            verdict_weights[v] = verdict_weights.get(v, 0) + e["weight"]
+
+        final_verdict = max(verdict_weights, key=verdict_weights.get)
+        majority_count = sum(1 for e in weighted_entries if e["verdict"] == final_verdict)
+
+        # ── Weighted confidence ──
+        total_weight = sum(e["weight"] for e in weighted_entries)
+        if total_weight > 0:
+            weighted_confidence = sum(e["confidence"] * e["weight"] for e in weighted_entries) / total_weight
+        else:
+            weighted_confidence = sum(e["confidence"] for e in weighted_entries) / len(weighted_entries)
+
+        # Cap confidence if high dissent
+        dissent_count = sum(1 for e in weighted_entries if e["verdict"] != final_verdict)
+        if dissent_count >= total_models / 2:
+            weighted_confidence = min(weighted_confidence, 45)
+            consensus_note = "high-dissent"
+        elif majority_count == total_models:
             consensus_note = "unanimous"
         elif majority_count > total_models / 2:
-            # True majority — use only majority models' confidence, penalized 10%
-            majority_confs = [
-                a["result"].get("confidence", 50) for a in analyses
-                if a["result"].get("verdict") == final_verdict
-            ]
-            avg_confidence = int(sum(majority_confs) / len(majority_confs) * 0.9)
             consensus_note = "majority"
         else:
-            # No majority (3-way tie) — use minimum (most conservative)
-            avg_confidence = min(confidences)
+            weighted_confidence = min(weighted_confidence, 40)
             consensus_note = "no-majority"
-            print(f"  [Brain] ⚠ No majority verdict — using most conservative confidence ({avg_confidence}%)")
 
-        # ── Build dissent section ──
+        avg_confidence = int(weighted_confidence)
+
+        # ── Build dissent section with roles ──
         dissent = []
-        for a in analyses:
-            v = a["result"].get("verdict", "?")
-            if v != final_verdict:
+        for e in weighted_entries:
+            if e["verdict"] != final_verdict:
                 dissent.append({
-                    "model": f"{a['provider']}/{a['model']}",
-                    "verdict": v,
-                    "confidence": a["result"].get("confidence", 0),
+                    "model": f"{e['provider']}/{e['model']}",
+                    "role": e["role"],
+                    "verdict": e["verdict"],
+                    "confidence": e["confidence"],
+                    "weight": round(e["weight"], 2),
+                    "unknowns": e["unknowns"],
                     "reasoning": (
-                        a["result"].get("debate_note", "")
-                        or a["result"].get("executive_summary", "")
-                        or a["result"].get("summary", "")
+                        e["result"].get("debate_note", "")
+                        or e["result"].get("executive_summary", "")
+                        or e["result"].get("summary", "")
                     )[:300],
                 })
 
         if dissent:
             print(f"  [Brain] Dissent from {len(dissent)} model(s):")
             for d in dissent:
-                print(f"    {d['model']}: {d['verdict']} ({d['confidence']}%) — {d['reasoning'][:80]}...")
+                print(f"    [{d['role']}] {d['model']}: {d['verdict']} ({d['confidence']}%, weight={d['weight']}) — {d['reasoning'][:80]}")
 
-        # ── Merge evidence (deduplicate — use 200 chars to avoid false matches) ──
+        # ── Print weighting details ──
+        print(f"  [Brain] Weights:")
+        for e in weighted_entries:
+            print(f"    [{e['role']}] {e['provider']}/{e['model']}: "
+                  f"verdict={e['verdict']} conf={e['confidence']} "
+                  f"unknowns={e['unknowns']} weight={e['weight']:.2f}")
+
+        # ── Merge evidence (deduplicate) ──
         all_evidence = []
         seen_evidence = set()
         for a in analyses:
@@ -512,7 +693,6 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
                     seen_evidence.add(ev_key)
                     all_evidence.append(ev)
 
-        # Merge suggestions
         all_suggestions = []
         seen_sug = set()
         for a in analyses:
@@ -522,7 +702,6 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
                     seen_sug.add(sug_key)
                     all_suggestions.append(sug)
 
-        # Merge risk_factors from all models
         all_risks = []
         seen_risks = set()
         for a in analyses:
@@ -533,7 +712,6 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
                     seen_risks.add(risk_key)
                     all_risks.append(risk)
 
-        # Merge action_plan items
         all_actions = []
         seen_actions = set()
         for a in analyses:
@@ -544,7 +722,6 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
                     seen_actions.add(act_key)
                     all_actions.append(act)
 
-        # Merge top_posts from all models (dedup by title)
         all_top_posts = []
         seen_titles = set()
         for a in analyses:
@@ -554,14 +731,28 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
                     seen_titles.add(tp_title)
                     all_top_posts.append(tp)
 
-        # For text fields, pick the LONGEST version across all models (more detail = better)
+        # Merge all top_unknowns from all models (critical for transparency)
+        all_unknowns = []
+        seen_unknowns = set()
+        for a in analyses:
+            for unk in a["result"].get("top_unknowns", []):
+                unk_key = unk.lower().strip()[:200]
+                if unk_key not in seen_unknowns:
+                    seen_unknowns.add(unk_key)
+                    all_unknowns.append(unk)
+
         def _pick_longest(field, default=""):
             candidates = [str(a["result"].get(field, "")) for a in analyses if a["result"].get(field)]
             return max(candidates, key=len) if candidates else default
 
-        # Build models_used
         models_used = [f"{a['provider']}/{a['model']}" for a in analyses]
-        model_verdicts = {f"{a['provider']}/{a['model']}": a["result"].get("verdict", "?") for a in analyses}
+        model_verdicts = {
+            f"{a['provider']}/{a['model']}": {
+                "verdict": a["result"].get("verdict", "?"),
+                "role": a.get("role", "ANALYST"),
+            }
+            for a in analyses
+        }
 
         merged = {
             "verdict": final_verdict,
@@ -576,17 +767,22 @@ Respond with the same JSON format as before, but add a "debate_note" field expla
             "suggestions": all_suggestions[:10],
             "action_plan": all_actions[:8],
             "top_posts": all_top_posts[:6],
+            "top_unknowns": all_unknowns[:10],
             # Multi-model metadata
             "models_used": models_used,
             "model_verdicts": model_verdicts,
             "debate_mode": len(analyses) > 1,
-            # Tiebreaker metadata
+            # Weighted consensus metadata
             "consensus_strength": f"{majority_count}/{total_models}",
             "consensus_type": consensus_note,
+            "weighting_method": "inverse_uncertainty",
             "dissent": dissent,
         }
 
-        print(f"  [Brain] Final: {final_verdict} ({avg_confidence}%) — {majority_count}/{total_models} consensus, {len(all_evidence)} evidence, {len(all_risks)} risks")
+        print(f"  [Brain] Final: {final_verdict} ({avg_confidence}%) — "
+              f"{majority_count}/{total_models} {consensus_note}, "
+              f"{len(all_evidence)} evidence, {len(all_risks)} risks, "
+              f"{len(all_unknowns)} unknowns surfaced")
         return merged
 
 
