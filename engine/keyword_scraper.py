@@ -197,27 +197,92 @@ def run_keyword_scan(keywords: list, duration: str = "10min", on_progress=None):
             break
         time.sleep(2.5)
 
-    # ── Phase 2: Subreddit-specific searches ──
-    for sub in BUSINESS_SUBREDDITS:
-        if time.time() - start_time > max_seconds:
-            break
+    # ── Phase 2: Async subreddit-specific searches ──
+    if on_progress:
+        on_progress(len(all_posts), "Async scanning subreddits...")
+
+    try:
+        import asyncio
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from reddit_async import scrape_all_async, AIOHTTP_AVAILABLE
+
+        if AIOHTTP_AVAILABLE:
+            async_posts = asyncio.run(scrape_all_async(
+                subreddits=BUSINESS_SUBREDDITS,
+                sorts=["new"],
+                max_concurrent=6,
+            ))
+            for post_data in async_posts:
+                # Re-check keyword match
+                text_lower = post_data.get("full_text", "").lower()
+                matched_kw = [kw for kw in keywords if kw.lower() in text_lower]
+                if matched_kw and post_data.get("external_id") not in seen_ids:
+                    seen_ids.add(post_data["external_id"])
+                    post_data["matched_keywords"] = matched_kw
+                    # Adapt fields to keyword_scraper format
+                    post_data["id"] = post_data.get("external_id", "")
+                    post_data["selftext"] = post_data.get("body", "")
+                    post_data["permalink"] = post_data.get("permalink", "")
+                    all_posts.append(post_data)
+
+            if on_progress:
+                on_progress(len(all_posts), f"Async scan done: {len(all_posts)} posts")
+        else:
+            raise ImportError("aiohttp not available")
+    except Exception as e:
+        # Fallback to sequential
+        print(f"    [!] Async unavailable ({e}), using sequential scan")
+        for sub in BUSINESS_SUBREDDITS:
+            if time.time() - start_time > max_seconds:
+                break
+            if on_progress:
+                on_progress(len(all_posts), f"Searching r/{sub}...")
+            children, _ = search_subreddit(sub, keywords)
+            new_count = 0
+            for child in children:
+                post = _parse_post(child, keywords)
+                if post and post["id"] not in seen_ids:
+                    seen_ids.add(post["id"])
+                    all_posts.append(post)
+                    new_count += 1
+            if new_count > 0:
+                print(f"    r/{sub}: +{new_count} posts (total: {len(all_posts)})")
+            time.sleep(2.5)
+
+    # ── Phase 2.5: PullPush.io historical backfill ──
+    if on_progress:
+        on_progress(len(all_posts), "Fetching historical data (PullPush)...")
+
+    try:
+        from pullpush_scraper import scrape_historical
+        query = " ".join(keywords[:3])  # Top 3 keywords for historical search
+        for sub in BUSINESS_SUBREDDITS[:8]:  # Top 8 subs for historical depth
+            if time.time() - start_time > max_seconds:
+                break
+            pp_posts = scrape_historical(sub, keyword=query, days_back=90, size=50)
+            new_count = 0
+            for post_data in pp_posts:
+                eid = post_data.get("external_id", "")
+                if eid and eid not in seen_ids:
+                    text_lower = post_data.get("full_text", "").lower()
+                    matched_kw = [kw for kw in keywords if kw.lower() in text_lower]
+                    if matched_kw:
+                        seen_ids.add(eid)
+                        post_data["id"] = eid
+                        post_data["matched_keywords"] = matched_kw
+                        post_data["selftext"] = post_data.get("body", "")
+                        all_posts.append(post_data)
+                        new_count += 1
+            if new_count > 0:
+                print(f"    [PP] r/{sub}: +{new_count} historical posts")
+            time.sleep(0.5)
 
         if on_progress:
-            on_progress(len(all_posts), f"Searching r/{sub}...")
-
-        children, _ = search_subreddit(sub, keywords)
-        new_count = 0
-        for child in children:
-            post = _parse_post(child, keywords)
-            if post and post["id"] not in seen_ids:
-                seen_ids.add(post["id"])
-                all_posts.append(post)
-                new_count += 1
-
-        if new_count > 0:
-            print(f"    r/{sub}: +{new_count} posts (total: {len(all_posts)})")
-
-        time.sleep(2.5)
+            on_progress(len(all_posts), f"Historical backfill done: {len(all_posts)} posts")
+    except Exception as e:
+        print(f"    [!] PullPush backfill skipped: {e}")
 
     # ── Phase 3: If long scan, keep polling for new posts ──
     if max_seconds > 600:

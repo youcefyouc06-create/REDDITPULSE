@@ -18,6 +18,7 @@ import sys
 import json
 import time
 import re
+import asyncio
 import math
 import hashlib
 import argparse
@@ -726,34 +727,85 @@ def run_scraper_job(sources=None, topic_filter=None):
             if data:
                 run_id = data[0].get("id")
 
-    # ── 1. Scrape ──
+    # ── 1. Scrape (4-Layer Architecture) ──
     all_posts = []
+    seen_ids = set()
+
+    def _merge(new_posts):
+        """Deduplicate and merge posts into all_posts."""
+        added = 0
+        for p in new_posts:
+            eid = p.get("external_id", "")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                all_posts.append(p)
+                added += 1
+        return added
 
     if "reddit" in sources:
-        print("\n  [1/4] Scraping Reddit...")
-        reddit_posts = scrape_all_reddit()
-        all_posts.extend(reddit_posts)
-        print(f"  [OK] Reddit: {len(reddit_posts)} posts")
+        # ── Layer 1: Async Reddit JSON API (~15s for 42 subs) ──
+        print("\n  [1/6] Layer 1 — Async Reddit scrape...")
+        try:
+            from reddit_async import scrape_all_async
+            reddit_posts = asyncio.run(scrape_all_async())
+            added = _merge(reddit_posts)
+            print(f"  [OK] Layer 1 (async): {added} fresh posts")
+        except Exception as e:
+            print(f"  [!] Layer 1 async failed, falling back to sync: {e}")
+            reddit_posts = scrape_all_reddit()
+            added = _merge(reddit_posts)
+            print(f"  [OK] Layer 1 (sync fallback): {added} posts")
+
+        # ── Layer 2: PullPush.io Historical (90 days back) ──
+        print("\n  [2/6] Layer 2 — PullPush historical scrape...")
+        try:
+            from pullpush_scraper import scrape_historical_multi
+            pp_posts = scrape_historical_multi(days_back=90, size_per_sub=100, delay=0.5)
+            added = _merge(pp_posts)
+            print(f"  [OK] Layer 2 (PullPush): +{added} historical posts")
+        except Exception as e:
+            print(f"  [!] Layer 2 (PullPush) skipped: {e}")
+
+        # ── Layer 3: Reddit Sitemap (real-time discovery) ──
+        print("\n  [3/6] Layer 3 — Sitemap real-time discovery...")
+        try:
+            from sitemap_listener import discover_new_posts
+            sitemap_posts = discover_new_posts(max_fetch=30)
+            added = _merge(sitemap_posts)
+            print(f"  [OK] Layer 3 (sitemap): +{added} newly discovered posts")
+        except Exception as e:
+            print(f"  [!] Layer 3 (sitemap) skipped: {e}")
+
+        # ── Layer 4: PRAW authenticated (optional) ──
+        try:
+            from reddit_auth import is_available as praw_available, scrape_all_authenticated
+            if praw_available():
+                print("\n  [3.5/6] Layer 4 — PRAW authenticated deep dive...")
+                praw_posts = scrape_all_authenticated(TARGET_SUBREDDITS[:10], sorts=["rising"])
+                added = _merge(praw_posts)
+                print(f"  [OK] Layer 4 (PRAW): +{added} authenticated posts")
+        except Exception as e:
+            pass  # PRAW is optional, silent skip
 
     if "hackernews" in sources:
-        print("\n  [2/4] Scraping Hacker News...")
+        print("\n  [4/6] Scraping Hacker News...")
         hn_posts = scrape_hn()
-        all_posts.extend(hn_posts)
+        _merge(hn_posts)
         print(f"  [OK] HN: {len(hn_posts)} posts")
 
     if "producthunt" in sources:
-        print("\n  [3/4] Scraping ProductHunt...")
+        print("\n  [5/6] Scraping ProductHunt...")
         ph_posts = scrape_ph()
-        all_posts.extend(ph_posts)
+        _merge(ph_posts)
         print(f"  [OK] PH: {len(ph_posts)} posts")
 
     if "indiehackers" in sources:
-        print("\n  [4/4] Scraping IndieHackers...")
+        print("\n  [6/6] Scraping IndieHackers...")
         ih_posts = scrape_ih()
-        all_posts.extend(ih_posts)
+        _merge(ih_posts)
         print(f"  [OK] IH: {len(ih_posts)} posts")
 
-    print(f"\n  Total posts scraped: {len(all_posts)}")
+    print(f"\n  Total posts scraped (deduplicated): {len(all_posts)}")
 
     if not all_posts:
         print("  [!] No posts collected — exiting")
