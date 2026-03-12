@@ -9,6 +9,17 @@ import time
 import math
 import requests
 from datetime import datetime
+from pathlib import Path
+
+# Load .env from project root
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    with open(_env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip())
 
 
 GH_API = "https://api.github.com"
