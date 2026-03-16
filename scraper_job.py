@@ -163,6 +163,14 @@ def _to_epoch_timestamp(value):
     return 0.0
 
 
+def _post_activity_timestamp(post):
+    """Recent-signal timestamp with scraped_at fallback for live feeds."""
+    created_ts = _to_epoch_timestamp(post.get("created_utc", 0))
+    if created_ts > 0:
+        return created_ts
+    return _to_epoch_timestamp(post.get("scraped_at", 0))
+
+
 def _build_source_breakdown(posts):
     counter = Counter(post.get("source", "unknown") for post in posts if post.get("source"))
     return [
@@ -388,13 +396,26 @@ def scrape_all_reddit(subreddits=None):
 
 
 def scrape_hn():
-    """Scrape Hacker News via Algolia API."""
+    """Scrape recent Hacker News posts for live trend detection."""
     try:
-        from hn_scraper import run_hn_scrape
-        raw = run_hn_scrape(
-            ["startup", "saas", "tool", "problem", "frustrated", "alternative", "invoice", "automation"],
-            max_pages=3,
-        )
+        from hn_scraper import search_hn_recent
+
+        raw = []
+        seen_ids = set()
+        keywords = ["startup", "saas", "tool", "problem", "frustrated", "alternative", "invoice", "automation"]
+
+        for keyword in keywords:
+            keyword_posts = search_hn_recent(keyword, hits_per_page=100)
+            added = 0
+            for post in keyword_posts:
+                post_id = str(post.get("id", post.get("objectID", "")))
+                if not post_id or post_id in seen_ids:
+                    continue
+                seen_ids.add(post_id)
+                raw.append(post)
+                added += 1
+            print(f"    [HN live] '{keyword}': +{added} recent posts (total {len(raw)})")
+
         # Normalize to our format
         posts = []
         for p in raw:
@@ -813,7 +834,7 @@ def classify_post_to_topics(post):
 # SCORE CALCULATOR — The price formula
 # ═══════════════════════════════════════════════════════
 
-def calculate_idea_score(topic_slug, posts, existing_idea=None):
+def calculate_idea_score(topic_slug, posts, signal_posts=None, existing_idea=None):
     """
     Calculate the live score (0-100) for an idea topic.
     
@@ -824,7 +845,9 @@ def calculate_idea_score(topic_slug, posts, existing_idea=None):
         engagement_signal    * 0.20
     )
     """
-    if not posts:
+    signal_posts = signal_posts or posts
+
+    if not posts or not signal_posts:
         return 0.0, {}
 
     now = time.time()
@@ -833,13 +856,13 @@ def calculate_idea_score(topic_slug, posts, existing_idea=None):
     thirty_days_ago = now - 30 * 86400
 
     # Parse timestamps
-    post_count_24h = sum(1 for post in posts if _to_epoch_timestamp(post.get("created_utc", 0)) > twenty_four_hours_ago)
+    post_count_24h = sum(1 for post in signal_posts if _post_activity_timestamp(post) > twenty_four_hours_ago)
 
     # ── Velocity (how many posts in last 7 days vs previous) ──
-    recent_count = sum(1 for post in posts if _to_epoch_timestamp(post.get("created_utc", 0)) > seven_days_ago)
+    recent_count = sum(1 for post in signal_posts if _post_activity_timestamp(post) > seven_days_ago)
     older_count = sum(
-        1 for post in posts
-        if seven_days_ago >= _to_epoch_timestamp(post.get("created_utc", 0)) > thirty_days_ago
+        1 for post in signal_posts
+        if seven_days_ago >= _post_activity_timestamp(post) > thirty_days_ago
     )
 
     if older_count > 0:
@@ -850,7 +873,7 @@ def calculate_idea_score(topic_slug, posts, existing_idea=None):
     velocity_score = min(velocity_ratio * 15, 100)
 
     # ── Cross-platform (how many different sources) ──
-    source_breakdown = _build_source_breakdown(posts)
+    source_breakdown = _build_source_breakdown(signal_posts)
     source_names = [item["platform"] for item in source_breakdown]
     source_count = len(source_breakdown)
     cross_platform_multipliers = {1: 1.0, 2: 1.5, 3: 2.2, 4: 3.0}
@@ -858,21 +881,21 @@ def calculate_idea_score(topic_slug, posts, existing_idea=None):
     cross_platform_score = min(source_count * 25 * cp_mult / 3.0, 100)
 
     # ── Engagement (avg upvotes + comments) ──
-    total_engagement = sum(p.get("score", 0) + p.get("num_comments", 0) for p in posts)
-    avg_engagement = total_engagement / max(len(posts), 1)
+    total_engagement = sum(p.get("score", 0) + p.get("num_comments", 0) for p in signal_posts)
+    avg_engagement = total_engagement / max(len(signal_posts), 1)
     engagement_score = min(math.log(avg_engagement + 1) / 7.0 * 100, 100)
 
     # ── Pain signal (how many match pain phrases) ──
     pain_count = 0
-    for p in posts:
+    for p in signal_posts:
         text_lower = (p.get("full_text", "") or "").lower()
         if any(phrase.lower() in text_lower for phrase in PAIN_PHRASES[:20]):
             pain_count += 1
-    pain_ratio = pain_count / max(len(posts), 1)
+    pain_ratio = pain_count / max(len(signal_posts), 1)
     pain_boost = pain_ratio * 20
 
     # ── Volume bonus (more data = more confident) ──
-    volume_bonus = min(math.log(len(posts) + 1) / math.log(500) * 15, 15)
+    volume_bonus = min(math.log(len(signal_posts) + 1) / math.log(500) * 15, 15)
 
     # ── Final score ──
     raw_score = (
@@ -896,7 +919,7 @@ def calculate_idea_score(topic_slug, posts, existing_idea=None):
         "source_names": source_names,
         "post_count_24h": post_count_24h,
         "post_count_7d": recent_count,
-        "post_count_total": len(posts),
+        "post_count_total": len(signal_posts),
         "pain_count": pain_count,
     }
 
@@ -978,17 +1001,35 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
 
     # ── 1. Scrape (4-Layer Architecture) ──
     all_posts = []
-    seen_ids = set()
+    all_post_map = {}
+    live_posts = []
+    live_ids = set()
+    historical_ids = set()
 
-    def _merge(new_posts):
+    def _merge(new_posts, bucket="live"):
         """Deduplicate and merge posts into all_posts."""
         added = 0
         for p in new_posts:
             eid = p.get("external_id", "")
-            if eid and eid not in seen_ids:
-                seen_ids.add(eid)
+            if not eid:
+                continue
+
+            if not p.get("scraped_at"):
+                p["scraped_at"] = datetime.now(timezone.utc).isoformat()
+
+            if eid not in all_post_map:
+                all_post_map[eid] = p
                 all_posts.append(p)
                 added += 1
+
+            canonical = all_post_map[eid]
+            if bucket == "live":
+                if eid not in live_ids:
+                    live_ids.add(eid)
+                    live_posts.append(canonical)
+            elif bucket == "historical":
+                if eid not in historical_ids and eid not in live_ids:
+                    historical_ids.add(eid)
         return added
 
     all_subs = load_user_requested_subreddits()
@@ -999,17 +1040,17 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
         try:
             from reddit_async import scrape_all_async
             reddit_posts = asyncio.run(scrape_all_async(subreddits=all_subs))
-            added = _merge(reddit_posts)
+            added = _merge(reddit_posts, bucket="live")
             print(f"  [OK] Layer 1 (async): {added} fresh posts")
             if added < 10:
                 print("  [!] Layer 1 async returned too few posts - retrying with sync scraper")
                 reddit_posts = scrape_all_reddit(subreddits=all_subs)
-                added = _merge(reddit_posts)
+                added = _merge(reddit_posts, bucket="live")
                 print(f"  [OK] Layer 1 (sync recovery): +{added} posts")
         except Exception as e:
             print(f"  [!] Layer 1 async failed, falling back to sync: {e}")
             reddit_posts = scrape_all_reddit(subreddits=all_subs)
-            added = _merge(reddit_posts)
+            added = _merge(reddit_posts, bucket="live")
             print(f"  [OK] Layer 1 (sync fallback): {added} posts")
 
         # ── Layer 2: PullPush.io Historical (90 days back) ──
@@ -1017,7 +1058,7 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
         try:
             from pullpush_scraper import scrape_historical_multi
             pp_posts = scrape_historical_multi(subreddits=all_subs, days_back=90, size_per_sub=100, delay=0.5)
-            added = _merge(pp_posts)
+            added = _merge(pp_posts, bucket="historical")
             print(f"  [OK] Layer 2 (PullPush): +{added} historical posts")
         except Exception as e:
             print(f"  [!] Layer 2 (PullPush) skipped: {e}")
@@ -1027,7 +1068,7 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
         try:
             from sitemap_listener import discover_new_posts
             sitemap_posts = discover_new_posts(max_fetch=30)
-            added = _merge(sitemap_posts)
+            added = _merge(sitemap_posts, bucket="live")
             print(f"  [OK] Layer 3 (sitemap): +{added} newly discovered posts")
         except Exception as e:
             print(f"  [!] Layer 3 (sitemap) skipped: {e}")
@@ -1038,7 +1079,7 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
             if praw_available():
                 print("\n  [3.5/6] Layer 4 — PRAW authenticated deep dive...")
                 praw_posts = scrape_all_authenticated(all_subs[:10], sorts=["rising"])
-                added = _merge(praw_posts)
+                added = _merge(praw_posts, bucket="live")
                 print(f"  [OK] Layer 4 (PRAW): +{added} authenticated posts")
         except Exception as e:
             pass  # PRAW is optional, silent skip
@@ -1046,22 +1087,24 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
     if "hackernews" in sources:
         print("\n  [4/6] Scraping Hacker News...")
         hn_posts = scrape_hn()
-        _merge(hn_posts)
+        _merge(hn_posts, bucket="live")
         print(f"  [OK] HN: {len(hn_posts)} posts")
 
     if "producthunt" in sources:
         print("\n  [5/6] Scraping ProductHunt...")
         ph_posts = scrape_ph()
-        _merge(ph_posts)
+        _merge(ph_posts, bucket="live")
         print(f"  [OK] PH: {len(ph_posts)} posts")
 
     if "indiehackers" in sources:
         print("\n  [6/6] Scraping IndieHackers...")
         ih_posts = scrape_ih()
-        _merge(ih_posts)
+        _merge(ih_posts, bucket="live")
         print(f"  [OK] IH: {len(ih_posts)} posts")
 
     print(f"\n  Total posts scraped (deduplicated): {len(all_posts)}")
+    print(f"  Live signal corpus: {len(live_posts)} posts")
+    print(f"  Historical support corpus: {len(historical_ids)} posts")
 
     if not all_posts:
         print("  [!] No posts collected — exiting")
@@ -1108,21 +1151,31 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
             print(f"  [Pulse] Score updates skipped: {e}")
 
     # ── 2. Cluster posts → ideas ──
+    signal_posts = live_posts if live_posts else all_posts
+
     print("\n  Clustering posts into idea topics...")
     idea_posts = defaultdict(list)
+    signal_posts_by_topic = defaultdict(list)
 
     for post in all_posts:
         topics = classify_post_to_topics(post)
         for topic in topics:
             idea_posts[topic].append(post)
 
+    for post in signal_posts:
+        topics = classify_post_to_topics(post)
+        for topic in topics:
+            signal_posts_by_topic[topic].append(post)
+
     # Filter by topic if specified
     if topic_filter:
         idea_posts = {k: v for k, v in idea_posts.items() if k in topic_filter}
+        signal_posts_by_topic = {k: v for k, v in signal_posts_by_topic.items() if k in topic_filter}
 
-    matched_ideas = len(idea_posts)
-    matched_posts = sum(len(v) for v in idea_posts.values())
-    print(f"  [OK] {matched_posts} posts matched into {matched_ideas} idea topics")
+    active_topic_posts = signal_posts_by_topic if signal_posts_by_topic else idea_posts
+    matched_ideas = len(active_topic_posts)
+    matched_posts = sum(len(v) for v in active_topic_posts.values())
+    print(f"  [OK] {matched_posts} live-signal posts matched into {matched_ideas} idea topics")
 
     # ── 3. Load existing ideas from Supabase ──
     existing_ideas = {}
@@ -1142,7 +1195,8 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
     history_to_insert = []
     ideas_updated = 0
 
-    for slug, posts in idea_posts.items():
+    for slug, signal_bucket in active_topic_posts.items():
+        posts = idea_posts.get(slug, signal_bucket)
         topic_info = TRACKED_TOPICS.get(slug, {})
 
         # Handle dynamic topics (sub-<subreddit> from unmatched posts)
@@ -1155,7 +1209,11 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
         else:
             topic_name = slug.replace("-", " ").title()
 
-        score, breakdown = calculate_idea_score(slug, posts)
+        score, breakdown = calculate_idea_score(
+            slug,
+            posts,
+            signal_posts=signal_bucket,
+        )
         existing = existing_ideas.get(slug)
 
         # Get previous scores for trend calculation

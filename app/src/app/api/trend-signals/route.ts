@@ -63,6 +63,16 @@ function estimatePostCount24h(row: Record<string, unknown>) {
     return Math.max(1, Math.round(sevenDay / 7));
 }
 
+function isFreshIdea(row: Record<string, unknown>, maxAgeHours = 48) {
+    const lastUpdated = String(row.last_updated || "");
+    if (!lastUpdated) return false;
+
+    const updatedAt = Date.parse(lastUpdated);
+    if (Number.isNaN(updatedAt)) return false;
+
+    return Date.now() - updatedAt <= maxAgeHours * 60 * 60 * 1000;
+}
+
 function classifyTrend(row: Record<string, unknown>, sourceCount: number, postCount24h: number): TrendTier | null {
     const postCount7d = Number(row.post_count_7d || 0);
     const currentScore = Number(row.current_score || 0);
@@ -116,8 +126,8 @@ export async function GET() {
             .from("ideas")
             .select("*")
             .neq("confidence_level", "INSUFFICIENT")
-            .order("change_24h", { ascending: false })
-            .limit(120),
+            .order("last_updated", { ascending: false })
+            .limit(300),
         supabaseAdmin
             .from("idea_validations")
             .select("report")
@@ -138,6 +148,7 @@ export async function GET() {
         []) as PlatformWarning[];
 
     const trends = (data || [])
+        .filter((row: Record<string, unknown>) => isFreshIdea(row))
         .map((row: Record<string, unknown>) => {
             const sources = normalizeSources(row.sources);
             const sourceCount = Number(row.source_count || sources.length || 0);
