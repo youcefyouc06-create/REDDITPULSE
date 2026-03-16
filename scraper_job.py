@@ -26,6 +26,7 @@ import traceback
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
+from urllib.parse import quote
 
 # Add engine to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "engine"))
@@ -64,9 +65,10 @@ def _headers():
 def sb_upsert(table, rows, on_conflict=""):
     """Upsert rows to Supabase. Returns response."""
     h = _headers()
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
     if on_conflict:
         h["Prefer"] = "resolution=merge-duplicates,return=representation"
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
+        url = f"{url}?on_conflict={quote(on_conflict, safe=',')}"
     r = requests.post(url, json=rows, headers=h, timeout=30)
     if r.status_code >= 400:
         print(f"    [!] Supabase {table} error {r.status_code}: {r.text[:200]}")
