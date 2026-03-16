@@ -82,14 +82,19 @@
 | **Multi-Platform Scraping** | Reddit (42 subs), Hacker News, ProductHunt, IndieHackers — simultaneously | Community Pain |
 | **AI Slop Filter** | 4-pass analysis drops AI-generated noise (30+ ChatGPT signatures detected) | Data Quality |
 | **Multi-Brain Debate** | 2–3 AI models analyze independently → debate disagreements → synthesize consensus | Validation |
+| **13-Section Intelligence Report** | Executive synthesis, ICP persona card, competition matrix, financial reality check, risk matrix, market timing, first-10 strategy with outreach scripts, and more | Strategy |
+| **Expandable Live Terminal** | Click-to-expand terminal showing real-time agent debate with styled role cards | UX |
 | **Credibility Engine** | Shannon entropy diversity scoring — source diversity beats raw volume | Confidence |
 | **Complaint Velocity** | Tracks posts-per-week growth to detect exploding pain points | Timing |
-| **Competition Analyzer** | Google-based G2/PH product counting with Blue Ocean → Saturated tiers | Market |
-| **ICP Detector** | Aggregates persona, budget, pain intensity, and tool sentiment from posts | Customer |
+| **Competition Analyzer** | Deep competitor cards with threat levels, attack angles, user complaints, biggest threat/easiest win | Market |
+| **ICP Detector** | Persona + communities + influencers + buying objections + WTP evidence + day-in-life | Customer |
+| **Financial Reality Check** | Break-even analysis, time-to-$1K/$10K MRR, CAC budget, gross margin | Finance |
 | **Google Trends Velocity** | Checks if pain is growing (🚀 EXPLODING) or dying (💀 DEAD) | Timing |
 | **Deep Signal Enrichment** | Stack Overflow unanswered questions + GitHub issues with 👍 reactions | Builder Pain |
 | **WTP Extraction** | Detects "I'd pay $X/month" signals with budget evidence | Revenue |
 | **Keyword Scan** | Timed scans (10min → 48h) with continuous polling for fresh posts | Discovery |
+| **Pain Stream Monitor** | Real-time Reddit pain point alerts with configurable keywords | Discovery |
+| **Competitor Deathwatch** | Tracks competitor complaint velocity on G2/Reddit for vulnerability windows | Competitive |
 
 ---
 
@@ -132,11 +137,13 @@ RedditPulse/
 │   │   │   │   ├── page.tsx            # Dashboard page route
 │   │   │   │   ├── layout.tsx          # Dashboard layout route
 │   │   │   │   ├── scans/page.tsx      # Keyword scan launcher
-│   │   │   │   ├── validate/page.tsx   # Idea validator
+│   │   │   │   ├── validate/page.tsx   # Idea validator (expandable terminal + live debate cards)
 │   │   │   │   ├── explore/page.tsx    # Opportunity explorer
 │   │   │   │   ├── trends/page.tsx     # Trend analysis
 │   │   │   │   ├── competitors/page.tsx# Competition analysis
 │   │   │   │   ├── reports/page.tsx    # Saved reports
+│   │   │   │   ├── reports/[id]/page.tsx # 13-section intelligence report
+│   │   │   │   ├── alerts/page.tsx     # Pain point alerts
 │   │   │   │   ├── saved/page.tsx      # Bookmarks
 │   │   │   │   ├── wtp/page.tsx        # WTP signal viewer
 │   │   │   │   ├── digest/page.tsx     # Digest view
@@ -179,11 +186,14 @@ RedditPulse/
 │   ├── competition.py                  # Google-based competition tier analysis
 │   ├── icp.py                          # Ideal Customer Profile aggregator
 │   ├── trends.py                       # Google Trends velocity layer (pytrends)
-│   └── report_synthesizer.py           # AI-powered Market Signal Report generator
+│   ├── report_synthesizer.py           # AI-powered Market Signal Report generator
+│   ├── pain_stream.py                  # Real-time Reddit pain point monitor
+│   ├── competitor_deathwatch.py        # Competitor complaint velocity tracker
+│   └── graveyard.py                    # Failed startup idea graveyard engine
 │
 ├── scraper_job.py                      # Main scraper orchestrator (933 lines)
 ├── run_scan.py                         # Scan runner with multi-brain debate (532 lines)
-├── validate_idea.py                    # 3-phase AI idea validator (1075 lines)
+├── validate_idea.py                    # 3-phase AI idea validator with enriched prompts (1629 lines)
 ├── enrich_idea.py                      # Deep signal enrichment orchestrator (266 lines)
 │
 ├── sql/
@@ -239,7 +249,7 @@ RedditPulse/
 |---|---|---|
 | `scraper_job.py` | 933 | Full scraper pipeline: Reddit (42 subs + search) → HN → PH → IH → analyze → score → cluster → upsert to Supabase `ideas` table |
 | `run_scan.py` | 532 | Keyword-based scan: keyword search → multi-platform collection → AI analysis → multi-brain debate synthesis → update Supabase `scans` |
-| `validate_idea.py` | 1075 | 3-phase AI validation: Phase 1 (evidence gathering) → Phase 2 (deep analysis) → Phase 3 (multi-brain debate verdict) |
+| `validate_idea.py` | 1629 | 3-phase AI validation with enriched prompts: Phase 1 (evidence gathering + batch analysis) → Phase 2 (ICP + competition with deep schemas) → Phase 3 (roadmap with validation gates + financial reality + risk matrix) → Multi-brain debate verdict |
 | `enrich_idea.py` | 266 | Deep signal enrichment: Stack Overflow + GitHub Issues → cache to Supabase `enrichment_cache` with 7-day TTL |
 
 ---
@@ -490,6 +500,28 @@ python enrich_idea.py invoice-automation --keywords "invoice,billing"
 - The `enrichment_cache` has a **7-day TTL** — stale data auto-expires via DB trigger
 - **Rate limits**: Reddit (2.5s delay), HN (0.5s), PH (1s per page), IH (0.5s), SO (monitored quota), GitHub (token recommended)
 - All Supabase tables have **RLS enabled** — the service role key bypasses RLS for backend writes
+
+---
+
+## Validation Report Sections
+
+The 13-section intelligence report generated by the validation engine:
+
+| # | Section | What It Shows |
+|---|---|---|
+| 1 | **Executive Synthesis** | AI-generated strategic summary |
+| 2 | **Signal Summary** | Posts scraped / analyzed / pain quotes / WTP signals / competitor mentions |
+| 3 | **ICP Persona Card** | Primary persona, day-in-life, demographics, communities, influencers, tools, buying objections, WTP evidence |
+| 4 | **Price Signals & WTP** | Pricing tiers with features, competitor price benchmarks |
+| 5 | **Market Timing Intelligence** | Timing assessment, TAM estimate, pain validation badge |
+| 6 | **Competition Network** | Competitor cards with threat level badges, attack angles, user complaints, biggest threat / easiest win, moat strategy |
+| 7 | **Financial Reality Check** | Break-even users, time-to-$1K/$10K MRR, CAC budget, gross margin |
+| 8 | **Risk Matrix** | Severity × probability badges, mitigation steps, owner tags (min 5 risks) |
+| 9 | **Raw Evidence Ingestion** | Platform-tagged evidence posts with scores and relevance notes |
+| 10 | **Launch Trajectory** | Roadmap steps with validation gates, channel badges, cost estimates, expected outcomes |
+| 11 | **First 10 Customers Strategy** | 3-phase outreach (customers 1-3 / 4-7 / 8-10) with channel, tactic, and word-for-word scripts |
+| 12 | **Debate Room** | Multi-model consensus trace with reasoning, verdict shifts, and confidence per round |
+| 13 | **MVP vs Cut Features** | Core launch features vs defer-to-later features |
 
 ---
 
