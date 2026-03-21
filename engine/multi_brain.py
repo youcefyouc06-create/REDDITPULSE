@@ -1546,6 +1546,9 @@ Respond with the same JSON format. Add a "debate_note" field explaining why you 
         return merged
 
 
+MultiBrain = AIBrain
+
+
 # ═══════════════════════════════════════════════════════
 # STANDALONE TEST
 # ═══════════════════════════════════════════════════════

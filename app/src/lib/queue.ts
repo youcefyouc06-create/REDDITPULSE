@@ -184,7 +184,29 @@ async function updateValidation(validationId: string, updates: Record<string, un
 async function updateValidationProgress(validationId: string, lines: ValidationProgressLine[]) {
     const supabaseAdmin = getSupabaseAdmin();
     const latest = lines[lines.length - 1];
+    const { data: current, error: currentError } = await supabaseAdmin
+        .from("idea_validations")
+        .select("status, report")
+        .eq("id", validationId)
+        .single();
+
+    if (currentError) {
+        throw new Error(
+            `Could not load validation ${validationId} before progress update: ${currentError.message}`,
+        );
+    }
+
+    if (current?.status === "done" || current?.status === "failed") {
+        return;
+    }
+
+    const existingReport =
+        current?.report && typeof current.report === "object" && !Array.isArray(current.report)
+            ? current.report as Record<string, unknown>
+            : {};
+
     const report = {
+        ...existingReport,
         live_progress: {
             lines,
             latest_message: latest?.message || "",
@@ -196,12 +218,14 @@ async function updateValidationProgress(validationId: string, lines: ValidationP
         .from("idea_validations")
         .update({ report })
         .eq("id", validationId)
+        .neq("status", "done")
+        .neq("status", "failed")
         .select("id")
-        .single();
+        .maybeSingle();
 
-    if (error || !data) {
+    if (error) {
         throw new Error(
-            `Could not persist validation progress ${validationId}: ${error?.message || "row not found after update"}`,
+            `Could not persist validation progress ${validationId}: ${error.message}`,
         );
     }
 }

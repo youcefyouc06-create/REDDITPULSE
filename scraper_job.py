@@ -316,6 +316,137 @@ def _build_pain_summary(posts, topic_name=""):
     return summary[:420], matched_posts
 
 
+MARKET_PAIN_KEYWORDS = [
+    "hate", "frustrated", "struggling", "help",
+    "issue", "problem", "broken", "slow",
+    "expensive", "annoying", "anyone else",
+    "does anyone", "how do i", "why does",
+    "can't", "cannot", "won't", "doesn't work",
+    "need help", "looking for", "recommendations",
+    "alternative", "manual", "tedious", "waste",
+    "hours", "every month", "pain", "tired of",
+    "sick of", "wish there was", "dream of",
+]
+
+
+def _compose_post_text(post):
+    """Combine the post fields we actually scrape across platforms."""
+    return " ".join(
+        str(part).strip()
+        for part in (
+            post.get("title", ""),
+            post.get("body", ""),
+            post.get("selftext", ""),
+            post.get("full_text", ""),
+        )
+        if str(part).strip()
+    )
+
+
+def _normalized_market_source(post):
+    """Normalize raw scraper sources for market-card display."""
+    source = (post.get("source", "") or "").strip().lower()
+    if source.startswith("reddit"):
+        return "reddit"
+    return source
+
+
+def is_pain_post(post):
+    text = _compose_post_text(post).lower()
+    return any(keyword in text for keyword in MARKET_PAIN_KEYWORDS)
+
+
+def pain_score(post):
+    text = _compose_post_text(post).lower()
+    return sum(1 for keyword in MARKET_PAIN_KEYWORDS if keyword in text)
+
+
+def _engagement_score(post):
+    return int(post.get("score", 0) or 0) + int(post.get("num_comments", 0) or 0)
+
+
+def build_top_posts_for_topic(posts):
+    """
+    Select topic posts for the Market page by pain relevance first, then engagement.
+    """
+    if not posts:
+        return []
+
+    deduped = {}
+    for post in posts:
+        key = post.get("external_id") or post.get("permalink") or post.get("url") or post.get("title")
+        if key and key not in deduped:
+            deduped[key] = post
+
+    ranked_posts = sorted(
+        deduped.values(),
+        key=lambda post: (pain_score(post), _engagement_score(post)),
+        reverse=True,
+    )
+    pain_posts = [post for post in ranked_posts if is_pain_post(post)]
+
+    selected = list(pain_posts[:5])
+    if len(selected) < 3:
+        for post in sorted(deduped.values(), key=_engagement_score, reverse=True):
+            key = post.get("external_id") or post.get("permalink") or post.get("url") or post.get("title")
+            if key and all(
+                key != (picked.get("external_id") or picked.get("permalink") or picked.get("url") or picked.get("title"))
+                for picked in selected
+            ):
+                selected.append(post)
+            if len(selected) >= 5:
+                break
+
+    available_sources = []
+    for post in ranked_posts:
+        source = _normalized_market_source(post)
+        if source and source not in available_sources:
+            available_sources.append(source)
+
+    def _rank_tuple(post):
+        return (pain_score(post), _engagement_score(post))
+
+    selected = selected[:5]
+    for source in available_sources:
+        if source in {_normalized_market_source(post) for post in selected}:
+            continue
+
+        replacement = next((post for post in ranked_posts if _normalized_market_source(post) == source), None)
+        if not replacement:
+            continue
+
+        if len(selected) < 5:
+            selected.append(replacement)
+            continue
+
+        selected_counts = Counter(_normalized_market_source(post) for post in selected)
+        replace_index = None
+        weakest_rank = None
+        for index, post in enumerate(selected):
+            post_source = _normalized_market_source(post)
+            if selected_counts.get(post_source, 0) <= 1:
+                continue
+            current_rank = _rank_tuple(post)
+            if weakest_rank is None or current_rank < weakest_rank:
+                weakest_rank = current_rank
+                replace_index = index
+
+        if replace_index is not None:
+            selected[replace_index] = replacement
+
+    selected.sort(key=_rank_tuple, reverse=True)
+
+    return [{
+        "title": (post.get("title", "") or "")[:200],
+        "source": _normalized_market_source(post),
+        "subreddit": post.get("subreddit", ""),
+        "score": int(post.get("score", 0) or 0),
+        "comments": int(post.get("num_comments", 0) or 0),
+        "url": post.get("permalink") or post.get("url") or "",
+        "pain_score": pain_score(post),
+    } for post in selected[:5]]
+
+
 def store_posts(rows):
     """Persist raw posts so Realtime, alerts, and trend aggregation have live data."""
     if not SUPABASE_URL or not rows:
@@ -896,22 +1027,39 @@ SUBREDDIT_CATEGORIES = {
 
 def classify_post_to_topics(post):
     """Match a post to one or more tracked topics. Returns list of topic slugs."""
-    text = (post.get("full_text", "") or post.get("title", "")).lower()
+    text = _compose_post_text(post).lower()
+    subreddit = (post.get("subreddit", "") or "").lower().strip()
+    subreddit_text = subreddit.replace("_", " ").replace("-", " ")
+    combined_text = f"{subreddit_text} {text}".strip()
+    source = _normalized_market_source(post)
+    subreddit_category = SUBREDDIT_CATEGORIES.get(subreddit, "")
     matches = []
 
     for slug, topic_info in TRACKED_TOPICS.items():
         score = 0
         phrase_hit = False
+        keyword_hits = 0
         for keyword in topic_info["keywords"]:
             normalized = keyword.lower().strip()
             if not normalized:
                 continue
             if " " in normalized or "-" in normalized or "/" in normalized:
-                if normalized in text:
+                if normalized in combined_text:
                     score += 2
                     phrase_hit = True
-            elif re.search(rf"\b{re.escape(normalized)}\b", text):
+                    keyword_hits += 1
+            elif re.search(rf"\b{re.escape(normalized)}\b", combined_text):
                 score += 1
+                keyword_hits += 1
+
+        if (
+            source == "reddit"
+            and subreddit_category
+            and subreddit_category == topic_info.get("category")
+            and (keyword_hits > 0 or is_pain_post(post))
+        ):
+            # Reddit complaints often use category-native buyer language in body text.
+            score += 1
 
         if phrase_hit or score >= 2:
             matches.append((slug, score))
@@ -1335,16 +1483,7 @@ def run_scraper_job(sources=None, topic_filter=None, mode="full", source_label="
         if len(posts) < 3 and not existing:
             continue
 
-        # Get top 5 posts by engagement
-        top_posts = sorted(posts, key=lambda p: p.get("score", 0) + p.get("num_comments", 0), reverse=True)[:5]
-        top_posts_json = [{
-            "title": p.get("title", "")[:200],
-            "source": p.get("source", ""),
-            "subreddit": p.get("subreddit", ""),
-            "score": p.get("score", 0),
-            "comments": p.get("num_comments", 0),
-            "url": p.get("permalink", ""),
-        } for p in top_posts]
+        top_posts_json = build_top_posts_for_topic(posts)
         pain_summary, pain_count = _build_pain_summary(posts, topic_name)
 
         idea_row = {

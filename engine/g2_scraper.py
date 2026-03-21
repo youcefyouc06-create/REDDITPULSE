@@ -25,6 +25,11 @@ def _clean(text: str) -> str:
 class G2Scraper:
     BASE_URL = "https://www.g2.com/products"
 
+    def __init__(self):
+        self.last_status_code = None
+        self.last_url = ""
+        self.last_error = ""
+
     def _headers(self, idx: int = 0):
         return {
             "User-Agent": USER_AGENTS[idx % len(USER_AGENTS)],
@@ -34,10 +39,15 @@ class G2Scraper:
     def scrape_competitor_reviews(self, product_slug: str, max_reviews: int = 50):
         url = f"{self.BASE_URL}/{product_slug}/reviews"
         reviews = []
+        self.last_url = url
+        self.last_status_code = None
+        self.last_error = ""
 
         try:
             response = requests.get(url, headers=self._headers(), timeout=20)
+            self.last_status_code = response.status_code
             if response.status_code != 200:
+                self.last_error = f"http_{response.status_code}"
                 return reviews
 
             html = response.text
@@ -52,8 +62,6 @@ class G2Scraper:
                 date_match = re.search(r'datetime="([^"]+)"', block)
 
                 rating = int(float(rating_match.group(1))) if rating_match else 0
-                if rating and rating > 3:
-                    continue
 
                 dislikes = _clean(dislikes_match.group(1)) if dislikes_match else ""
                 if not dislikes:
@@ -71,7 +79,8 @@ class G2Scraper:
                     "date": date_match.group(1) if date_match else "",
                 })
                 time.sleep(0.25)
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
             return reviews
 
         return reviews[:max_reviews]

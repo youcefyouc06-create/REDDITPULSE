@@ -14,6 +14,10 @@ import re
 import argparse
 import traceback
 import requests
+from html import unescape as html_unescape
+from contextlib import contextmanager
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 # Add engine to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "engine"))
@@ -78,6 +82,12 @@ try:
 except ImportError:
     ICP_AVAILABLE = False
 
+try:
+    from g2_scraper import G2Scraper
+    G2_AVAILABLE = True
+except ImportError:
+    G2_AVAILABLE = False
+
 # ── Retention + Intelligence imports ──
 try:
     from pain_stream import create_alert as create_pain_alert
@@ -94,10 +104,24 @@ except ImportError:
 # ── Supabase config ──
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", os.environ.get("SUPABASE_KEY", ""))
+_VALIDATION_WRITE_SUPPRESSED = False
 
 
 class ValidationPersistenceError(RuntimeError):
     """Raised when validation state cannot be persisted to Supabase."""
+
+
+@contextmanager
+def _validation_write_mode(suppress_writes=False):
+    """Temporarily disable validation row writes for test-only runs."""
+    global _VALIDATION_WRITE_SUPPRESSED
+    previous = _VALIDATION_WRITE_SUPPRESSED
+    if suppress_writes:
+        _VALIDATION_WRITE_SUPPRESSED = True
+    try:
+        yield
+    finally:
+        _VALIDATION_WRITE_SUPPRESSED = previous
 
 
 def _supabase_headers():
@@ -115,6 +139,9 @@ def update_validation(validation_id, updates, retries=3):
     ECONNRESET mid-run was leaving status stuck at 'queued' in Supabase,
     causing the frontend poller to always see phase=0 and show 'Starting'.
     """
+    if _VALIDATION_WRITE_SUPPRESSED:
+        return True
+
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise ValidationPersistenceError("Supabase is not configured for validation state updates")
 
@@ -215,7 +242,18 @@ Extract keywords people would search for when experiencing this pain, list exist
 
     formal_cap = depth_config.get("formal_keyword_cap", 15)
     colloquial_cap = depth_config.get("colloquial_keyword_cap", 10)
-    sub_cap = depth_config.get("subreddit_cap", 8)
+    
+    # FIX 2: Depth-aware subreddit discovery budget
+    if depth_config.get("mode") == "deep":
+        sub_cap = 20
+    elif depth_config.get("mode") == "investigation":
+        sub_cap = 30
+    else:
+        # Quick or default
+        sub_cap = 8
+        
+    depth_config["subreddit_cap"] = sub_cap # Ensure it propagates
+    
     formal_keywords = _dedupe(data.get("keywords", []) + data.get("search_queries", []))[:formal_cap]
     colloquial_keywords = _dedupe(data.get("colloquial_keywords", []))[:colloquial_cap]
     if not colloquial_keywords:
@@ -247,6 +285,105 @@ Extract keywords people would search for when experiencing this pain, list exist
     return result
 
 
+def _fallback_ai_configs():
+    """Load AI configs from local env vars for CLI/test usage."""
+    fallback_configs = []
+    if os.environ.get("GEMINI_API_KEY"):
+        fallback_configs.append({
+            "provider": "gemini",
+            "api_key": os.environ["GEMINI_API_KEY"],
+            "selected_model": "gemini-2.0-flash",
+            "is_active": True,
+            "priority": 1,
+        })
+    if os.environ.get("GROQ_API_KEY"):
+        fallback_configs.append({
+            "provider": "groq",
+            "api_key": os.environ["GROQ_API_KEY"],
+            "selected_model": "llama-3.3-70b-versatile",
+            "is_active": True,
+            "priority": 2,
+        })
+    if os.environ.get("OPENAI_API_KEY"):
+        fallback_configs.append({
+            "provider": "openai",
+            "api_key": os.environ["OPENAI_API_KEY"],
+            "selected_model": "gpt-4o",
+            "is_active": True,
+            "priority": 3,
+        })
+    if os.environ.get("OPENROUTER_API_KEY"):
+        fallback_configs.append({
+            "provider": "openrouter",
+            "api_key": os.environ["OPENROUTER_API_KEY"],
+            "selected_model": "openrouter/deepseek/deepseek-r1",
+            "is_active": True,
+            "priority": 4,
+        })
+    return fallback_configs
+
+
+def _dummy_test_configs():
+    """Deterministic in-memory configs for unit tests that patch AI calls."""
+    return [
+        {
+            "id": "test-bull",
+            "provider": "nvidia",
+            "api_key": "test-key",
+            "selected_model": "test-bull-model",
+            "is_active": True,
+            "priority": 1,
+        },
+        {
+            "id": "test-skeptic",
+            "provider": "nvidia",
+            "api_key": "test-key",
+            "selected_model": "test-skeptic-model",
+            "is_active": True,
+            "priority": 2,
+        },
+        {
+            "id": "test-analyst",
+            "provider": "openrouter",
+            "api_key": "test-key",
+            "selected_model": "test-analyst-model",
+            "is_active": True,
+            "priority": 3,
+        },
+    ]
+
+
+def load_validation_configs(user_id="", test_mode=False):
+    """Load AI configs for validation runs with a safe test fallback."""
+    configs = []
+    if user_id:
+        configs = get_user_ai_configs(user_id)
+
+    if not configs:
+        configs = _fallback_ai_configs()
+
+    if not configs and test_mode:
+        configs = _dummy_test_configs()
+
+    return configs
+
+
+def run_phase1(
+    idea_text,
+    brain=None,
+    validation_id="test-phase1",
+    depth="quick",
+    user_id="",
+    test_mode=True,
+    configs=None,
+):
+    """Test-friendly wrapper around Phase 1 decomposition."""
+    depth_config = get_depth_config(depth)
+    with _validation_write_mode(test_mode):
+        brain = brain or AIBrain(configs or load_validation_configs(user_id=user_id, test_mode=test_mode))
+        return phase1_decompose(idea_text, brain, validation_id, depth_config=depth_config)
+
+
 # ═══════════════════════════════════════════════════════
 # SIGNAL WEIGHTING (platform authority × score × recency)
 # ═══════════════════════════════════════════════════════
@@ -258,13 +395,649 @@ PLATFORM_WEIGHTS = {
     "indiehackers": 1.2,   # Revenue-focused founders
     "stackoverflow": 1.2,  # Technical pain with implementation context
     "githubissues": 1.15,  # Open-source issue demand / friction signals
+    "g2_review": 1.25,     # Real buyer complaint language from competitor reviews
+    "job_posting": 1.15,   # Employer-written process/pain language
+    "vendor_blog": 0.9,    # Useful context, but vendor-authored not buyer-native
 }
 
 NON_DEV_ICP_KEYWORDS = [
     "accounting", "bookkeeping", "legal", "law firm", "medical", "healthcare",
     "restaurant", "retail", "small business", "firm", "agency", "clinic",
     "dentist", "real estate", "hr", "human resources", "finance",
+    "construction", "contractor", "builder", "hospitality", "property",
+    "landlord", "marketing", "campaign",
 ]
+
+ICP_TRIGGER_MAP = {
+    "B2B_HR": [
+        "hr", "human resources", "recruiting", "onboarding",
+        "payroll", "benefits", "people ops", "talent",
+        "employee", "workforce", "hris", "ats",
+    ],
+    "B2B_CONSTRUCTION": [
+        "construction", "contractor", "builder", "project manager",
+        "field service", "subcontractor", "gc", "jobsite",
+        "building", "civil engineering",
+    ],
+    "B2B_FINANCE": [
+        "accounting", "bookkeeping", "invoice", "payroll",
+        "tax", "cfo", "finance team", "quickbooks",
+    ],
+    "B2B_LEGAL": [
+        "legal", "lawyer", "attorney", "paralegal", "law firm",
+        "litigation", "contract", "compliance", "legaltech",
+    ],
+    "B2B_MARKETING": [
+        "marketing", "cmo", "attribution", "campaign",
+        "martech", "lead generation", "content marketing",
+        "seo", "social media manager", "ads", "lead gen",
+    ],
+    "B2B_SALES": [
+        "sales", "crm", "pipeline", "outbound",
+        "prospecting", "account executive", "revenue team", "quota",
+    ],
+    "B2B_OPS": [
+        "operations", "ops", "workflow", "sop",
+        "process management", "back office", "knowledge base", "documentation",
+    ],
+    "DEV_TOOL": [
+        "api", "sdk", "developer", "code", "programming",
+        "software engineer", "devops", "ci/cd", "machine learning model",
+        "llm", "ai model", "open source", "engineering",
+    ],
+    "B2B_RESTAURANT": [
+        "restaurant", "food service", "pos", "kitchen",
+        "cafe", "hospitality", "menu", "dining",
+    ],
+    "B2B_REALESTATE": [
+        "real estate", "property", "agent", "broker",
+        "landlord", "tenant", "leasing", "reit",
+    ],
+    "CONSUMER": [
+        "personal", "individual", "student", "habit",
+        "lifestyle", "daily routine", "self improvement",
+    ],
+    "ECOMMERCE": [
+        "ecommerce", "shopify", "etsy", "amazon seller",
+        "dropshipping", "inventory", "fulfillment", "storefront",
+    ],
+}
+
+ICP_SUBREDDITS = {
+    "B2B_HR": [
+        "humanresources", "AskHR", "recruiting",
+        "hrtech", "peopleops", "smallbusiness",
+        "Entrepreneur", "WorkAdvice",
+    ],
+    "B2B_CONSTRUCTION": [
+        "ConstructionManagers", "ConstructionTech",
+        "construction", "civilengineering",
+        "projectmanagement", "Homebuilding",
+        "smallbusiness",
+    ],
+    "B2B_FINANCE": [
+        "Accounting", "bookkeeping", "smallbusiness",
+        "tax", "FreshBooks", "QuickBooks", "Upwork", "freelance",
+    ],
+    "B2B_LEGAL": [
+        "paralegal", "LawFirm", "legaladvice",
+        "lawyers", "LegalTech", "law",
+    ],
+    "B2B_MARKETING": [
+        "marketing", "B2Bmarketing", "marketingops",
+        "SEO", "socialmedia", "PPC",
+    ],
+    "B2B_SALES": [
+        "sales", "Entrepreneur", "smallbusiness",
+        "B2BSales", "startups", "SaaS",
+    ],
+    "B2B_OPS": [
+        "operations", "Notion", "smallbusiness",
+        "Entrepreneur", "productivity", "sysadmin",
+    ],
+    "DEV_TOOL": [
+        "programming", "webdev", "cscareerquestions",
+        "MachineLearning", "LocalLLaMA", "devops",
+        "learnprogramming", "softwareengineering",
+    ],
+    "B2B_RESTAURANT": [
+        "restaurantowners", "kitchenconfidential",
+        "Restaurant", "FoodService",
+    ],
+    "B2B_REALESTATE": [
+        "RealEstateTechnology", "realestate",
+        "RealEstateInvesting", "landlord",
+    ],
+    "CONSUMER": [
+        "productivity", "getdisciplined", "selfimprovement",
+        "LifeProTips", "personalfinance", "Frugal",
+    ],
+    "ECOMMERCE": [
+        "shopify", "Etsy", "FulfillmentByAmazon",
+        "ecommerce", "smallbusiness", "Entrepreneur",
+    ],
+    "B2B_GENERAL": [
+        "smallbusiness", "Entrepreneur", "startups",
+        "SaaS", "microsaas",
+    ],
+}
+
+VENDOR_BLOGS = {
+    "B2B_HR": [
+        "https://www.shrm.org/topics-tools",
+        "https://www.bamboohr.com/blog",
+        "https://www.lattice.com/library",
+    ],
+    "B2B_FINANCE": [
+        "https://www.billtrust.com/resources/blog",
+        "https://quickbooks.intuit.com/r",
+        "https://www.freshbooks.com/blog",
+    ],
+    "B2B_CONSTRUCTION": [
+        "https://www.procore.com/jobsite",
+        "https://www.buildertrend.com/blog",
+        "https://www.constructconnect.com/blog",
+    ],
+    "B2B_LEGAL": [
+        "https://www.clio.com/blog",
+        "https://www.mycase.com/blog",
+    ],
+}
+
+ADZUNA_API_TEMPLATE = "https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
+LOW_VOLUME_ICPS = [
+    "B2B_CONSTRUCTION", "B2B_LEGAL",
+    "B2B_RESTAURANT", "B2B_REALESTATE",
+]
+ADZUNA_PAIN_TERMS = [
+    "streamline", "manage", "track", "automate", "reduce",
+    "improve", "solve", "handle", "process",
+]
+KNOWN_SOFTWARE_TERMS = [
+    "quickbooks", "expensify", "concur", "ramp", "procore", "netsuite",
+    "sage", "xero", "excel", "notion", "slack", "jira", "asana",
+    "bill.com", "stripe", "adp", "bamboohr", "clio", "mycase",
+]
+_ROBOTS_CACHE = {}
+_VENDOR_LAST_REQUEST_AT = {}
+
+NOISE_SUBREDDITS_FOR_NON_DEV = {
+    "machinelearning", "localllama", "openai",
+    "chatgpt", "artificial", "datascience",
+    "webdev", "programming", "learnprogramming",
+    "adhd", "depression", "teenagers", "books",
+    "3dprinting", "gaming", "languagetechnology",
+}
+
+
+def _normalized_subreddit_name(value):
+    return str(value or "").strip().lower().replace("r/", "").replace("/r/", "")
+
+
+def classify_icp(idea_text, audience, keywords):
+    text_parts = [idea_text or "", audience or ""] + list(keywords or [])
+    haystack = " ".join(str(part) for part in text_parts if part).lower()
+    scores = {}
+    for icp, triggers in ICP_TRIGGER_MAP.items():
+        scores[icp] = sum(1 for trigger in triggers if trigger.lower() in haystack)
+
+    vertical_priority = [
+        "B2B_CONSTRUCTION",
+        "B2B_LEGAL",
+        "B2B_RESTAURANT",
+        "B2B_REALESTATE",
+        "B2B_HR",
+    ]
+    vertical_matches = [(icp, scores.get(icp, 0)) for icp in vertical_priority if scores.get(icp, 0) > 0]
+    if vertical_matches:
+        vertical_matches.sort(key=lambda item: (item[1], -vertical_priority.index(item[0])), reverse=True)
+        return vertical_matches[0][0]
+
+    icp_priority = {
+        "DEV_TOOL": 9,
+        "B2B_CONSTRUCTION": 8,
+        "B2B_LEGAL": 7,
+        "B2B_FINANCE": 6,
+        "B2B_HR": 5,
+        "B2B_RESTAURANT": 4,
+        "B2B_REALESTATE": 3,
+        "B2B_MARKETING": 2,
+        "B2B_SALES": 1,
+    }
+
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: (item[1], icp_priority.get(item[0], 0), item[0].startswith("B2B_")),
+        reverse=True,
+    )
+    best_icp, best_score = ranked[0]
+    return best_icp if best_score > 0 else "B2B_GENERAL"
+
+
+def _route_forced_subreddits(icp, ai_suggested_subreddits):
+    whitelist = list(ICP_SUBREDDITS.get(icp, ICP_SUBREDDITS["B2B_GENERAL"]))
+    canonical = {_normalized_subreddit_name(sub): sub for sub in whitelist}
+    routed = list(whitelist)
+    seen = set(canonical.keys())
+
+    for subreddit in ai_suggested_subreddits or []:
+        normalized = _normalized_subreddit_name(subreddit)
+        if not normalized:
+            continue
+        if icp != "DEV_TOOL" and normalized in NOISE_SUBREDDITS_FOR_NON_DEV:
+            continue
+        if normalized in canonical and normalized not in seen:
+            routed.append(canonical[normalized])
+            seen.add(normalized)
+
+    return routed
+
+
+def _slugify_competitor_name(value):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug[:80]
+
+
+G2_SLUG_ALIASES = {
+    "expensify": ["expensify-1"],
+    "quickbooks": ["quickbooks-online"],
+    "quickbooks-online": ["quickbooks"],
+    "procore": ["procore-1"],
+    "procore-1": ["procore"],
+    "concur": ["sap-concur", "concur-1"],
+    "ramp": ["ramp-1"],
+}
+
+
+def _candidate_g2_slugs(competitor_name):
+    base = _slugify_competitor_name(competitor_name)
+    if not base:
+        return []
+
+    candidates = [base]
+    candidates.extend(G2_SLUG_ALIASES.get(base, []))
+    if not base.endswith("-1"):
+        candidates.append(f"{base}-1")
+
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        clean = str(candidate or "").strip().lower()
+        if clean and clean not in seen:
+            seen.add(clean)
+            deduped.append(clean)
+    return deduped
+
+
+def _g2_reviews_to_posts(competitor_name, reviews, product_slug=None):
+    posts = []
+    competitor_slug = str(product_slug or _slugify_competitor_name(competitor_name) or "").strip()
+    for idx, review in enumerate(reviews, start=1):
+        rating = int(review.get("rating") or 0)
+        if rating != 3:
+            continue
+        dislikes = str(review.get("dislikes") or "").strip()
+        if not dislikes:
+            continue
+        title = str(review.get("title") or "").strip() or f"{competitor_name} 3-star review"
+        full_text = f"{title}. {dislikes}".strip()
+        posts.append({
+            "id": f"g2-{competitor_slug}-{idx}",
+            "external_id": f"g2-{competitor_slug}-{idx}",
+            "title": title,
+            "selftext": dislikes,
+            "body": dislikes,
+            "full_text": full_text,
+            "score": 3,
+            "num_comments": 0,
+            "created_utc": review.get("date") or "",
+            "source": "g2_review",
+            "subreddit": f"g2/{competitor_slug}",
+            "url": f"https://www.g2.com/products/{competitor_slug}/reviews",
+            "permalink": f"https://www.g2.com/products/{competitor_slug}/reviews",
+            "matched_keywords": [],
+            "competitor": competitor_name,
+            "rating": rating,
+            "review_type": "3_star",
+            "industry": review.get("industry") or "",
+            "company_size": review.get("company_size") or "",
+        })
+    return posts
+
+
+def _fetch_g2_review_posts(icp, known_competitors, timeout_seconds=60):
+    if not G2_AVAILABLE:
+        return []
+    if not str(icp or "").startswith("B2B_"):
+        return []
+
+    start = time.time()
+    posts = []
+    scraper = G2Scraper()
+    for competitor in list(known_competitors or [])[:3]:
+        if time.time() - start >= timeout_seconds:
+            print(f"  [G2] Timeout reached after {timeout_seconds}s - continuing without more reviews")
+            break
+        candidate_slugs = _candidate_g2_slugs(competitor)
+        if not candidate_slugs:
+            continue
+        for slug in candidate_slugs:
+            if time.time() - start >= timeout_seconds:
+                print(f"  [G2] Timeout reached after {timeout_seconds}s while trying {competitor} - stopping")
+                break
+            url = f"https://www.g2.com/products/{slug}/reviews"
+            print(f"  [G2] Trying {competitor} -> {url}")
+            try:
+                reviews = scraper.scrape_competitor_reviews(slug, max_reviews=50)
+                if not reviews:
+                    status = scraper.last_status_code or "unknown"
+                    detail = f"status={status}"
+                    if scraper.last_error:
+                        detail += f", error={scraper.last_error}"
+                    print(f"  [G2] 0 reviews for {competitor} at {url} ({detail})")
+                    continue
+
+                matched_posts = _g2_reviews_to_posts(competitor, reviews, product_slug=slug)
+                if matched_posts:
+                    print(
+                        f"  [G2] {competitor}: {len(reviews)} raw reviews, "
+                        f"{len(matched_posts)} kept as 3-star signal posts via slug '{slug}'"
+                    )
+                    posts.extend(matched_posts)
+                    break
+
+                print(
+                    f"  [G2] {competitor}: {len(reviews)} raw reviews but 0 matched 3-star filter at {url}"
+                )
+            except Exception as exc:
+                print(f"  [G2] Failed for {competitor} at {url}: {str(exc)[:100]}")
+    return posts
+
+
+def _collect_meaningful_terms(idea_text="", audience="", keywords=None):
+    raw_terms = []
+    raw_terms.extend(re.findall(r"[a-zA-Z0-9][a-zA-Z0-9/+.-]{3,}", str(idea_text or "").lower()))
+    raw_terms.extend(re.findall(r"[a-zA-Z0-9][a-zA-Z0-9/+.-]{3,}", str(audience or "").lower()))
+    for keyword in keywords or []:
+        raw_terms.extend(re.findall(r"[a-zA-Z0-9][a-zA-Z0-9/+.-]{3,}", str(keyword or "").lower()))
+    stop = {"with", "from", "that", "this", "have", "your", "into", "their", "would", "there"}
+    deduped = []
+    seen = set()
+    for term in raw_terms:
+        clean = term.strip(".,!?()[]{}\"'").lower()
+        if len(clean) < 4 or clean in stop or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean)
+    return deduped
+
+
+def _strip_html_to_text(value):
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", str(value or ""))
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_pain_sentences(text, max_sentences=3):
+    sentences = re.split(r"(?<=[.!?])\s+", str(text or ""))
+    matches = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip() and any(term in sentence.lower() for term in ADZUNA_PAIN_TERMS)
+    ]
+    return matches[:max_sentences]
+
+
+def _extract_required_tools(text):
+    haystack = str(text or "").lower()
+    tools = [tool for tool in KNOWN_SOFTWARE_TERMS if tool in haystack]
+    return list(dict.fromkeys(tools))[:10]
+
+
+def _adzuna_job_to_post(job, keywords, icp):
+    description = _strip_html_to_text(job.get("description") or "")[:500]
+    pain_language = _extract_pain_sentences(description)
+    title = str(job.get("title") or "").strip()
+    if not title:
+        return None
+    combined = " ".join([title, description, " ".join(pain_language)]).strip()
+    matched_keywords = [kw for kw in (keywords or []) if str(kw or "").lower() in combined.lower()]
+    redirect_url = str(job.get("redirect_url") or "").strip()
+    job_id = str(job.get("id") or redirect_url or title).strip()
+    if not job_id:
+        return None
+    return {
+        "id": f"job-{job_id}",
+        "external_id": f"job-{job_id}",
+        "title": title,
+        "selftext": description,
+        "body": description,
+        "full_text": combined[:900],
+        "score": 4 if pain_language else 3,
+        "num_comments": 0,
+        "created_utc": job.get("created") or "",
+        "source": "job_posting",
+        "subreddit": f"adzuna/{str(icp or 'general').lower()}",
+        "url": redirect_url or job.get("adref") or "",
+        "permalink": redirect_url or job.get("adref") or "",
+        "matched_keywords": matched_keywords,
+        "required_tools": _extract_required_tools(description),
+        "pain_language": pain_language,
+        "company": ((job.get("company") or {}).get("display_name") if isinstance(job.get("company"), dict) else ""),
+    }
+
+
+def _fetch_adzuna_job_posts(keywords, icp, timeout_seconds=30, max_posts=50):
+    app_id = os.environ.get("ADZUNA_APP_ID", "").strip()
+    app_key = os.environ.get("ADZUNA_APP_KEY", "").strip()
+    country = os.environ.get("ADZUNA_COUNTRY", "us").strip().lower() or "us"
+    if not app_id or not app_key:
+        print("  [Jobs] Skipped - ADZUNA_APP_ID/ADZUNA_APP_KEY missing")
+        print(f"  [Jobs] Endpoint: {ADZUNA_API_TEMPLATE.format(country=country, page=1)}?app_id=...&app_key=...&what=<query>&results_per_page=10&content-type=application/json")
+        return []
+
+    start = time.time()
+    posts = []
+    seen = set()
+    queries = [str(kw).strip() for kw in (keywords or []) if str(kw).strip()][:5]
+    for query in queries:
+        if len(posts) >= max_posts or time.time() - start >= timeout_seconds:
+            break
+        endpoint = ADZUNA_API_TEMPLATE.format(country=country, page=1)
+        params = {
+            "app_id": app_id,
+            "app_key": app_key,
+            "what": query,
+            "results_per_page": min(10, max_posts - len(posts)),
+            "content-type": "application/json",
+        }
+        try:
+            response = requests.get(endpoint, params=params, timeout=15)
+            if response.status_code != 200:
+                print(f"  [Jobs] Query '{query}' failed: status={response.status_code}")
+                continue
+            payload = response.json() or {}
+            for job in payload.get("results", []) or []:
+                post = _adzuna_job_to_post(job, keywords, icp)
+                if not post:
+                    continue
+                dedupe_key = post.get("external_id") or post.get("url") or post.get("title")
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                posts.append(post)
+                if len(posts) >= max_posts:
+                    break
+        except Exception as exc:
+            print(f"  [Jobs] Query '{query}' failed: {str(exc)[:100]}")
+    print(f"  [Jobs] {len(posts)} job postings found across {len(queries)} queries")
+    return posts
+
+
+def _robots_parser_for(url):
+    parsed = urlparse(url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    if robots_url in _ROBOTS_CACHE:
+        return _ROBOTS_CACHE[robots_url]
+    parser = RobotFileParser()
+    parser.set_url(robots_url)
+    try:
+        parser.read()
+    except Exception:
+        parser = None
+    _ROBOTS_CACHE[robots_url] = parser
+    return parser
+
+
+def _vendor_can_fetch(url, user_agent="RedditPulseBot/1.0"):
+    parser = _robots_parser_for(url)
+    if parser is None:
+        return False
+    try:
+        return parser.can_fetch(user_agent, url)
+    except Exception:
+        return False
+
+
+def _rate_limited_get(url, user_agent="RedditPulseBot/1.0", timeout=15):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    last_request = _VENDOR_LAST_REQUEST_AT.get(host, 0.0)
+    wait = 2.0 - (time.time() - last_request)
+    if wait > 0:
+        time.sleep(wait)
+    response = requests.get(
+        url,
+        headers={"User-Agent": user_agent, "Accept-Language": "en-US,en;q=0.9"},
+        timeout=timeout,
+    )
+    _VENDOR_LAST_REQUEST_AT[host] = time.time()
+    return response
+
+
+def _extract_internal_links(html, base_url):
+    base_host = urlparse(base_url).netloc.lower()
+    links = []
+    seen = set()
+    for href in re.findall(r'href=["\\\']([^"\\\']+)["\\\']', str(html or ""), re.I):
+        if href.startswith(("mailto:", "javascript:", "#")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if parsed.netloc.lower() != base_host:
+            continue
+        normalized = absolute.split("#", 1)[0]
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append(normalized)
+    return links
+
+
+def _extract_title_from_html(html, fallback=""):
+    for pattern in [
+        r'(?is)<meta[^>]+property=["\\\']og:title["\\\'][^>]+content=["\\\']([^"\\\']+)["\\\']',
+        r'(?is)<title[^>]*>(.*?)</title>',
+        r'(?is)<h1[^>]*>(.*?)</h1>',
+    ]:
+        match = re.search(pattern, str(html or ""))
+        if match:
+            return _strip_html_to_text(match.group(1))
+    return fallback
+
+
+def _fetch_vendor_blog_posts(icp, idea_text, keywords, max_posts=20):
+    blog_roots = VENDOR_BLOGS.get(icp, [])
+    if not blog_roots:
+        return []
+
+    keyword_terms = _collect_meaningful_terms(idea_text=idea_text, keywords=keywords)
+    posts = []
+    seen_urls = set()
+
+    for root_url in blog_roots:
+        if len(posts) >= max_posts:
+            break
+        if not _vendor_can_fetch(root_url):
+            print(f"  [Blogs] Skipped by robots.txt: {root_url}")
+            continue
+        try:
+            response = _rate_limited_get(root_url)
+            if response.status_code != 200:
+                print(f"  [Blogs] Failed index {root_url}: status={response.status_code}")
+                continue
+            links = _extract_internal_links(response.text, root_url)
+        except Exception as exc:
+            print(f"  [Blogs] Failed index {root_url}: {str(exc)[:100]}")
+            continue
+
+        ranked_links = sorted(
+            links,
+            key=lambda link: sum(1 for term in keyword_terms if term in link.lower()),
+            reverse=True,
+        )
+        selected_links = [link for link in ranked_links if any(term in link.lower() for term in keyword_terms)][:5]
+
+        for article_url in selected_links:
+            if len(posts) >= max_posts or article_url in seen_urls:
+                continue
+            if not _vendor_can_fetch(article_url):
+                continue
+            try:
+                article_response = _rate_limited_get(article_url)
+                if article_response.status_code != 200:
+                    continue
+                article_html = article_response.text
+                title = _extract_title_from_html(article_html, fallback=article_url.rstrip("/").split("/")[-1].replace("-", " "))
+                excerpt = _strip_html_to_text(article_html)[:300]
+                combined = f"{title}. {excerpt}".strip()
+                if not any(term in combined.lower() for term in keyword_terms):
+                    continue
+                seen_urls.add(article_url)
+                posts.append({
+                    "id": f"vendor-{len(posts)+1}-{abs(hash(article_url))}",
+                    "external_id": f"vendor-{abs(hash(article_url))}",
+                    "title": title,
+                    "selftext": excerpt,
+                    "body": excerpt,
+                    "full_text": combined[:700],
+                    "score": 3,
+                    "num_comments": 0,
+                    "created_utc": "",
+                    "source": "vendor_blog",
+                    "subreddit": urlparse(article_url).netloc.lower(),
+                    "url": article_url,
+                    "permalink": article_url,
+                    "matched_keywords": [kw for kw in (keywords or []) if str(kw or "").lower() in combined.lower()],
+                })
+            except Exception as exc:
+                print(f"  [Blogs] Failed article {article_url}: {str(exc)[:100]}")
+
+    print(f"  [Blogs] {len(posts)} vendor blog excerpts found")
+    return posts[:max_posts]
+
+
+def _log_optional_source_config():
+    adzuna_configured = bool(os.environ.get("ADZUNA_APP_ID", "").strip() and os.environ.get("ADZUNA_APP_KEY", "").strip())
+    g2_configured = bool(G2_AVAILABLE)
+    print(f"  [CONFIG] Adzuna: {'✓ configured' if adzuna_configured else '✗ missing (job postings disabled)'}")
+    print(f"  [CONFIG] G2: {'✓ configured' if g2_configured else '✗ missing (competitor reviews disabled)'}")
+
+
+def _pullpush_settings(icp, mode):
+    settings = {
+        "keyword_budget": 5 if mode == "deep" else 8,
+        "days_back": 90,
+        "timeout": 90,
+    }
+    if icp in LOW_VOLUME_ICPS:
+        settings["days_back"] = 365
+        settings["timeout"] = 180
+    return settings
 
 
 def _compute_weighted_score(post):
@@ -388,7 +1161,16 @@ def _is_audience_platform_mismatch(idea_text: str, dominant_platform: str, domin
 # PHASE 2: MARKET SCRAPING
 # ═══════════════════════════════════════════════════════
 
-def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, validation_id, depth_config=None):
+def phase2_scrape(
+    formal_keywords,
+    colloquial_keywords,
+    required_subreddits,
+    validation_id,
+    depth_config=None,
+    idea_text="",
+    audience="",
+    known_competitors=None,
+):
     """Phase 2: Scrape ALL platforms for market signals."""
     if depth_config is None:
         depth_config = get_depth_config("quick")
@@ -416,14 +1198,24 @@ def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, val
             reddit_keywords.append(clean)
     if not reddit_keywords:
         reddit_keywords = scrape_keywords[:8]
+    idea_icp = classify_icp(idea_text, audience, formal_keywords)
+    required_subreddits = _route_forced_subreddits(idea_icp, required_subreddits)
     required_subreddits = [
         str(sub).strip().replace("r/", "").replace("/r/", "")
         for sub in (required_subreddits or [])
         if str(sub).strip()
     ]
     source_counts = {}
+    scrape_audit = {
+        "idea_icp": idea_icp,
+        "forced_subreddits": list(required_subreddits),
+        "discovered_subreddits": [],
+        "subreddit_post_counts": {},
+    }
     platform_warnings = []  # Track platforms that returned 0 results or were unavailable
 
+    print(f"  [ICP] {idea_icp} ✓")
+    print(f"  [Forced subs] {', '.join(required_subreddits)} ✓")
     print(f"  [REDDIT]  colloquial_keywords: {reddit_keywords}")
     print(f"  [HN]      formal keywords: {scrape_keywords}")
     print(f"  [PH]      formal keywords: {scrape_keywords}")
@@ -433,17 +1225,131 @@ def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, val
 
     # ── Reddit ──
     print(f"  [>] Scraping Reddit for: {reddit_keywords} (lookback={reddit_duration})")
-    reddit_posts = run_keyword_scan(
-        reddit_keywords,
-        duration=reddit_duration,
-        on_progress=on_progress,
-        forced_subreddits=required_subreddits,
-        min_keyword_matches=reddit_min_matches,
+    
+    # FIX 3: Run PullPush (historical) in parallel with Async Scraper
+    import concurrent.futures
+    reddit_posts = []
+    
+    # Only run PullPush for deep/investigation modes
+    mode = depth_config.get("mode")
+    if mode in ("deep", "investigation"):
+        pullpush_settings = _pullpush_settings(idea_icp, mode)
+        pullpush_kw_budget = pullpush_settings["keyword_budget"]
+        pullpush_lookback_days = pullpush_settings["days_back"]
+        pullpush_timeout = pullpush_settings["timeout"]
+        if idea_icp in LOW_VOLUME_ICPS:
+            print(f"  [PP] Using extended lookback for low-volume ICP: {idea_icp}")
+        pullpush_subs = required_subreddits or []
+        # Add a few core subs if forced list is too small
+        if len(pullpush_subs) < 3:
+            pullpush_subs.extend(["SaaS", "Entrepreneur", "startups"])
+            pullpush_subs = list(set(pullpush_subs))[:10]
+            
+        print(f"  [PP] Launching background PullPush for {pullpush_subs} (timeout {pullpush_timeout}s, lookback {pullpush_lookback_days}d)")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Task 1: Async Scraper (Fast recent data)
+            async_future = executor.submit(
+                run_keyword_scan,
+                reddit_keywords,
+                duration=reddit_duration,
+                on_progress=on_progress,
+                forced_subreddits=required_subreddits,
+                min_keyword_matches=reddit_min_matches,
+                idea_text=idea_text,
+                icp_category=idea_icp,
+                return_metadata=True,
+            )
+            
+            # Task 2: PullPush (Historical data)
+            from engine.pullpush_scraper import scrape_historical_multi
+            pp_future = executor.submit(
+                scrape_historical_multi,
+                subreddits=pullpush_subs,
+                keywords=reddit_keywords[:pullpush_kw_budget],
+                days_back=pullpush_lookback_days,
+                size_per_sub=50
+            )
+            
+            # Collect Async Scraper (must complete)
+            async_result = async_future.result()
+            if isinstance(async_result, dict):
+                reddit_posts.extend(async_result.get("posts", []))
+                scrape_audit["discovered_subreddits"] = async_result.get("selected_subreddits", []) or []
+            else:
+                reddit_posts.extend(async_result)
+            
+            # Collect PullPush (can timeout/fail)
+            try:
+                pp_posts = pp_future.result(timeout=pullpush_timeout)
+                print(f"  [PP] ✓ Successfully retrieved {len(pp_posts)} historical posts")
+                # Deduplicate manually against async posts to handle different ID formats
+                seen_reddit_ids = {p.get("id") or p.get("external_id") for p in reddit_posts}
+                for p in pp_posts:
+                    pid = p.get("external_id")
+                    if pid and pid not in seen_reddit_ids:
+                        seen_reddit_ids.add(pid)
+                        # Normalize format to match async scraper output expectations downstream
+                        p["id"] = pid
+                        p["selftext"] = p.get("body", "")
+                        
+                        # Apply keyword filters again just to be safe
+                        text_lower = p.get("full_text", "").lower()
+                        from engine.keyword_scraper import _keyword_matches
+                        matched_kw = [kw for kw in reddit_keywords if _keyword_matches(kw, text_lower)]
+                        if len(matched_kw) >= 1:
+                            p["matched_keywords"] = matched_kw
+                            reddit_posts.append(p)
+            except concurrent.futures.TimeoutError:
+                print(f"  [PP] ⚠ PullPush hit hard timeout of {pullpush_timeout}s - continuing without full historical data")
+            except Exception as e:
+                print(f"  [PP] ⚠ PullPush background task failed: {str(e)[:100]}")
+    else:
+        # Quick mode — no PullPush parallelization needed
+        reddit_result = run_keyword_scan(
+            reddit_keywords,
+            duration=reddit_duration,
+            on_progress=on_progress,
+            forced_subreddits=required_subreddits,
+            min_keyword_matches=reddit_min_matches,
+            idea_text=idea_text,
+            icp_category=idea_icp,
+            return_metadata=True,
+        )
+        if isinstance(reddit_result, dict):
+            reddit_posts = reddit_result.get("posts", [])
+            scrape_audit["discovered_subreddits"] = reddit_result.get("selected_subreddits", []) or []
+        else:
+            reddit_posts = reddit_result
+    if mode in ("deep", "investigation"):
+        scrape_audit["discovered_subreddits"] = list(dict.fromkeys(
+            list(scrape_audit.get("discovered_subreddits", [])) + list(pullpush_subs)
+        ))
+    from collections import Counter as _Counter
+    scrape_audit["subreddit_post_counts"] = dict(
+        sorted(
+            _Counter(
+                str(p.get("subreddit") or "").strip().lower().replace("r/", "").replace("/r/", "")
+                for p in reddit_posts
+                if str(p.get("subreddit") or "").strip()
+            ).items()
+        )
     )
     source_counts["reddit"] = len(reddit_posts)
     print(f"  [✓] Reddit: {len(reddit_posts)} posts")
     if len(reddit_posts) == 0:
         platform_warnings.append({"platform": "reddit", "issue": "0 posts returned — Reddit scraping may have been rate-limited or keywords too niche"})
+
+    g2_posts = _fetch_g2_review_posts(idea_icp, known_competitors or [], timeout_seconds=60)
+    source_counts["g2_review"] = len(g2_posts)
+    if g2_posts:
+        print(f"  [✓] G2 Reviews: {len(g2_posts)} posts")
+
+    job_posts = _fetch_adzuna_job_posts(scrape_keywords[:5], idea_icp, timeout_seconds=30, max_posts=50)
+    source_counts["job_posting"] = len(job_posts)
+
+    vendor_blog_posts = _fetch_vendor_blog_posts(idea_icp, idea_text, scrape_keywords[:5], max_posts=20)
+    source_counts["vendor_blog"] = len(vendor_blog_posts)
 
     # ── Hacker News ──
     hn_posts = []
@@ -527,7 +1433,10 @@ def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, val
 
     # ── Merge + deduplicate + WEIGHT ──
     so_posts = []
-    if SO_AVAILABLE:
+    if idea_icp != "DEV_TOOL":
+        print("  [SO] Skipped — not a developer tool idea")
+        source_counts["stackoverflow"] = 0
+    elif SO_AVAILABLE:
         print("  [>] Scraping Stack Overflow...")
         try:
             so_posts = scrape_stackoverflow(
@@ -584,7 +1493,7 @@ def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, val
             "issue": "GitHub Issues: scraper not available. Coverage may be reduced.",
         })
 
-    all_posts = reddit_posts + hn_posts + ph_posts + ih_posts + so_posts + gh_posts
+    all_posts = reddit_posts + g2_posts + job_posts + vendor_blog_posts + hn_posts + ph_posts + ih_posts + so_posts + gh_posts
 
     # Apply signal weighting before dedup
     for p in all_posts:
@@ -634,7 +1543,7 @@ def phase2_scrape(formal_keywords, colloquial_keywords, required_subreddits, val
 
     print(f"  [✓] Total unique posts: {len(unique_posts)} from {platforms_used} platforms")
     print(f"  [✓] Sources: {source_counts}")
-    return unique_posts, source_counts, platform_warnings
+    return unique_posts, source_counts, platform_warnings, scrape_audit
 
 
 def phase2b_intelligence(
@@ -648,32 +1557,46 @@ def phase2b_intelligence(
     """Phase 2b: Google Trends + Competition Analysis."""
     intel = {"trends": None, "competition": None, "trend_prompt": "", "comp_prompt": ""}
 
-    # ── Google Trends ──
+    # ── Google Trends (with timeout guard) ──
     if TRENDS_AVAILABLE:
         print("\n  ══ PHASE 2b: Google Trends Analysis ══")
         update_validation(validation_id, {"status": "analyzing_trends"})
         try:
             trend_keywords = keywords[:5]  # Top 5 keywords for trends
-            trend_results = analyze_keywords(trend_keywords)
-            trend_report = trend_summary_for_report(trend_results)
-            intel["trends"] = trend_report
+            # Fix 2: Wrap in ThreadPoolExecutor with 45s timeout — pytrends can hang indefinitely
+            from concurrent.futures import ThreadPoolExecutor as _TrendsPool, TimeoutError as _TrendsTimeout
+            _trends_pool = _TrendsPool(max_workers=1)
+            _trends_future = _trends_pool.submit(analyze_keywords, trend_keywords)
+            try:
+                trend_results = _trends_future.result(timeout=45)
+            except _TrendsTimeout:
+                print("  [!] Trends analysis timed out after 45s — continuing without trends")
+                trend_results = {}
+            finally:
+                _trends_pool.shutdown(wait=False, cancel_futures=True)
 
-            # Build prompt section
-            growing = [k for k, v in trend_results.items() if v.tier in ("EXPLODING", "GROWING")]
-            declining = [k for k, v in trend_results.items() if v.tier in ("DECLINING", "DEAD")]
-            stable = [k for k, v in trend_results.items() if v.tier == "STABLE"]
+            if trend_results:
+                trend_report = trend_summary_for_report(trend_results)
+                intel["trends"] = trend_report
 
-            lines = ["\n--- GOOGLE TRENDS DATA ---"]
-            for kw, r in trend_results.items():
-                lines.append(f"  {kw}: {r.tier} ({r.change_pct:+.0f}% change, current interest: {r.current_interest})")
-            if growing:
-                lines.append(f"  Growing keywords: {', '.join(growing)}")
-            if declining:
-                lines.append(f"  Declining keywords: {', '.join(declining)}")
-            intel["trend_prompt"] = "\n".join(lines)
+                # Build prompt section
+                growing = [k for k, v in trend_results.items() if v.tier in ("EXPLODING", "GROWING")]
+                declining = [k for k, v in trend_results.items() if v.tier in ("DECLINING", "DEAD")]
+                stable = [k for k, v in trend_results.items() if v.tier == "STABLE"]
 
-            print(f"  [✓] Trends: {len(trend_results)} keywords analyzed")
-            print(f"      Growing: {growing}, Declining: {declining}, Stable: {stable}")
+                lines = ["\n--- GOOGLE TRENDS DATA ---"]
+                for kw, r in trend_results.items():
+                    lines.append(f"  {kw}: {r.tier} ({r.change_pct:+.0f}% change, current interest: {r.current_interest})")
+                if growing:
+                    lines.append(f"  Growing keywords: {', '.join(growing)}")
+                if declining:
+                    lines.append(f"  Declining keywords: {', '.join(declining)}")
+                intel["trend_prompt"] = "\n".join(lines)
+
+                print(f"  [✓] Trends: {len(trend_results)} keywords analyzed")
+                print(f"      Growing: {growing}, Declining: {declining}, Stable: {stable}")
+            else:
+                print("  [!] Trends: no data returned (timeout or empty)")
         except Exception as e:
             print(f"  [!] Trends analysis failed: {e}")
     else:
@@ -740,16 +1663,39 @@ Return ONLY valid JSON:
   "market_timing": "GROWING/STABLE/DECLINING — reference the trend data if available",
   "tam_estimate": "Total Addressable Market rough estimate with reasoning",
   "evidence": [
-    {"post_title": "Exact post title from the data", "source": "reddit/hn/ph/ih", "score": 123, "what_it_proves": "Specific insight this post provides"},
-    {"post_title": "Another exact title", "source": "reddit/hn/ph/ih", "score": 456, "what_it_proves": "Another insight"}
+    {"post_title": "Exact post title from the data", "source": "reddit/hn/ph/ih", "score": 123, "what_it_proves": "Specific insight this post provides", "relevance_tier": "DIRECT"},
+    {"post_title": "Another exact title", "source": "reddit/hn/ph/ih", "score": 456, "what_it_proves": "Another insight", "relevance_tier": "ADJACENT"}
   ]
 }
 
 RULES:
-- Include AT LEAST 15 evidence posts. More is better. Quote exact titles from the scraped data.
+- For each evidence item, add relevance_tier = DIRECT, ADJACENT, or IRRELEVANT.
+- DIRECT = exact buyer/problem/competitor/WTP match for this idea.
+- ADJACENT = related market context, but a different buyer, workflow, or pain.
+- IRRELEVANT = wrong audience, generic technology chatter, or a weak "space interest" signal.
+- Evidence arrays should be dominated by DIRECT posts. Include ADJACENT only for context. IRRELEVANT posts should normally be excluded entirely.
+- Include ONLY posts that are DIRECTLY relevant to the specific idea. If a post requires interpretation or stretching to connect to the idea, DO NOT include it.
+- Quality over quantity. 3 directly relevant posts are worth more than 15 tangentially related ones.
+- If you cannot find 5 directly relevant posts, state explicitly: "INSUFFICIENT DIRECT EVIDENCE — only X posts directly address this specific idea."
 - NEVER invent post titles. Only cite what appears in the data.
 - For WTP, search for dollar amounts, "I'd pay", "take my money", "shut up and take", pricing discussions.
 - Be specific with TAM — reference subreddit subscriber counts, post frequency, industry size.
+
+CRITICAL REJECTION RULE:
+A post is ONLY relevant if it directly mentions:
+- The specific problem this idea solves, OR
+- The specific buyer type (by name/role), OR
+- A competitor or alternative being used/complained about
+- An explicit willingness to pay for this type of solution
+
+Do NOT use a post as evidence if:
+- It mentions a related technology but not the problem
+- It's from a wrong audience (developer posts for non-dev ideas)
+- It requires 2+ logical steps to connect to the idea
+- The connection is "this shows general interest in the space"
+
+If you cite a post, the connection must be DIRECT and OBVIOUS.
+If you find yourself writing "this could indicate..." or "this suggests general interest in..." — DO NOT include it.
 """
 
 PASS2_SYSTEM = """You are a startup strategist. Given the market analysis results and competition data, design the STRATEGY.
@@ -837,6 +1783,22 @@ COMPETITION RULES — NON-NEGOTIABLE:
 - threat_level: HIGH = direct overlap + large user base. MEDIUM = partial overlap. LOW = tangential.
 - Pricing tiers must have concrete dollar amounts, not placeholders.
 - Moat strategy must be actionable, not generic "build a great product".
+
+CRITICAL REJECTION RULE:
+A post is ONLY relevant if it directly mentions:
+- The specific problem this idea solves, OR
+- The specific buyer type (by name/role), OR
+- A competitor or alternative being used/complained about
+- An explicit willingness to pay for this type of solution
+
+Do NOT use a post as evidence if:
+- It mentions a related technology but not the problem
+- It's from a wrong audience (developer posts for non-dev ideas)
+- It requires 2+ logical steps to connect to the idea
+- The connection is "this shows general interest in the space"
+
+If you cite a post, the connection must be DIRECT and OBVIOUS.
+If you find yourself writing "this could indicate..." or "this suggests general interest in..." — DO NOT include it.
 """
 
 PASS3_SYSTEM = """You are a startup launch advisor. Given the market analysis and strategy, create the ACTION PLAN.
@@ -932,12 +1894,12 @@ VERDICT_SYSTEM = """You are a venture analyst delivering a final verdict on a st
 
 Return ONLY valid JSON:
 {
-  "verdict": "BUILD IT" or "RISKY" or "DON'T BUILD",
+  "verdict": "BUILD IT" or "RISKY" or "DON'T BUILD" or "INSUFFICIENT DATA",
   "confidence": 0-100,
   "executive_summary": "4-5 sentence summary. Include: post count, platforms analyzed, trend direction, competition level, key WTP signals, and your honest recommendation. Be direct and data-driven.",
   "evidence": [
-    {"post_title": "Exact post title from the scraped data", "source": "reddit/hn/ph/ih", "score": 123, "what_it_proves": "Specific market signal this post reveals"},
-    {"post_title": "Another exact title", "source": "reddit/hn/ph/ih", "score": 456, "what_it_proves": "Another insight from this post"}
+    {"post_title": "Exact post title from the scraped data", "source": "reddit/hn/ph/ih", "score": 123, "what_it_proves": "Specific market signal this post reveals", "relevance_tier": "DIRECT"},
+    {"post_title": "Another exact title", "source": "reddit/hn/ph/ih", "score": 456, "what_it_proves": "Another insight from this post", "relevance_tier": "ADJACENT"}
   ],
   "risk_factors": [
     "Market risk: specific description with real data point",
@@ -955,11 +1917,45 @@ Return ONLY valid JSON:
 }
 
 RULES:
-- evidence: MINIMUM 10 posts. Quote EXACT titles from the posts you were given. NEVER invent titles.
+- evidence: Include ONLY directly relevant posts. Quote EXACT titles from the posts you were given. NEVER invent titles.
+- When prior evidence includes relevance_tier labels, treat DIRECT items as validation-grade proof and ADJACENT items as context only.
+- If fewer than 5 directly relevant evidence posts exist, say so explicitly instead of stretching adjacent posts into evidence.
 - risk_factors: MINIMUM 3 risks — at least one market risk, one technical risk, one execution risk.
-- top_posts: Pick the 10-20 most impactful posts from the data. More is better.
-- SCORING: "BUILD IT" = strong signal (50+ posts, multi-platform, WTP mentions, growing trends, clear gaps). "RISKY" = moderate signal (20-50 posts, few WTP, unclear differentiation, mixed trends). "DON'T BUILD" = weak signal (<20 posts, no WTP, saturated, declining trends).
+- top_posts: Pick the most impactful directly relevant posts from the data. Quality over quantity.
+- SCORING:
+  "BUILD IT" = strong signal (20+ DIRECTLY RELEVANT posts, multi-platform, explicit WTP mentions, growing trends)
+  "RISKY" = moderate signal (10-20 directly relevant posts, some WTP signals, unclear differentiation)
+  "DON'T BUILD" = weak signal (<10 directly relevant posts, no explicit WTP, saturated or declining trends)
+  "INSUFFICIENT DATA" = fewer than 5 directly relevant posts
 - Be BRUTALLY honest. The founder wants truth that makes money, not encouragement that wastes time.
+
+CRITICAL REJECTION RULE:
+A post is ONLY relevant if it directly mentions:
+- The specific problem this idea solves, OR
+- The specific buyer type (by name/role), OR
+- A competitor or alternative being used/complained about
+- An explicit willingness to pay for this type of solution
+
+Do NOT use a post as evidence if:
+- It mentions a related technology but not the problem
+- It's from a wrong audience (developer posts for non-dev ideas)
+- It requires 2+ logical steps to connect to the idea
+- The connection is "this shows general interest in the space"
+
+If you cite a post, the connection must be DIRECT and OBVIOUS.
+If you find yourself writing "this could indicate..." or "this suggests general interest in..." — DO NOT include it.
+
+EVIDENCE RELEVANCE GATE:
+Before scoring, count how many evidence posts are DIRECTLY relevant (see rejection rule above).
+
+If directly relevant posts < 5:
+  - Set pain_validated = false
+  - Set confidence below 40
+  - State explicitly: "THIN DIRECT EVIDENCE: Only X posts directly address this specific idea. The remaining evidence is from adjacent topics and should not be used to validate buyer demand."
+
+If directly relevant posts < 10:
+  - Cap confidence at 55
+  - Note: "MODERATE EVIDENCE: X directly relevant posts found. Broader post pool contains adjacent signal only."
 """
 
 
@@ -967,8 +1963,175 @@ RULES:
 # DATA QUALITY & CONTRADICTION DETECTION
 # ═══════════════════════════════════════════════════════
 
+def _meaningful_terms(value, min_len=4):
+    return [
+        word.lower().strip(".,!?")
+        for word in re.findall(r"[A-Za-z0-9_+-]+", str(value or ""))
+        if len(word) >= min_len
+    ]
+
+
+def _normalize_forced_subreddits(forced_subreddits):
+    return [
+        str(sub or "").strip().lower().replace("r/", "").replace("/r/", "")
+        for sub in (forced_subreddits or [])
+        if str(sub or "").strip()
+    ]
+
+
+SEMANTIC_GROUPS = {
+    "construction_domain": ["construction", "contractor", "contractors", "builder", "builders", "building", "jobsite", "civilengineering", "homebuilding"],
+    "finance_function": ["expense", "expenses", "receipt", "receipts", "report", "reports", "invoice", "invoices", "cost", "costs", "payment", "payments", "budget", "budgets", "reimbursement", "reimbursements"],
+    "automation_method": ["automation", "automate", "automated", "tracking", "track", "management", "manage", "software", "app", "apps", "tool", "tools"],
+    "hr_domain": ["hr", "human resources", "recruiting", "onboarding", "employee", "workforce", "people ops"],
+    "legal_domain": ["legal", "lawyer", "law firm", "attorney", "paralegal", "litigation", "compliance"],
+    "freelance_domain": ["freelance", "freelancer", "freelancers", "client", "clients", "agency"],
+    "restaurant_domain": ["restaurant", "restaurants", "kitchen", "cafe", "hospitality", "menu", "dining", "food service"],
+    "realestate_domain": ["real estate", "property", "landlord", "tenant", "leasing", "broker", "agent"],
+}
+
+
+def _active_semantic_groups(idea_text, keywords):
+    haystack = " ".join([str(idea_text or "")] + [str(kw or "") for kw in (keywords or [])]).lower()
+    active = {}
+    for group_name, terms in SEMANTIC_GROUPS.items():
+        if any(term in haystack for term in terms):
+            active[group_name] = list(terms)
+    return active
+
+
+def _matched_semantic_groups(text, idea_text, keywords):
+    text_lower = str(text or "").lower()
+    active = _active_semantic_groups(idea_text, keywords)
+    matched = {}
+    for group_name, terms in active.items():
+        hits = [term for term in terms if term in text_lower]
+        if hits:
+            matched[group_name] = hits
+    return matched
+
+
+def has_idea_specificity(title, idea_text, keywords):
+    """
+    Returns True only if the title contains terms from at least two
+    different semantic groups from the idea context.
+    """
+    matched_groups = _matched_semantic_groups(title, idea_text, keywords)
+    if len(matched_groups) < 2:
+        return False
+
+    title_lower = str(title or "").lower()
+    active = _active_semantic_groups(idea_text, keywords)
+
+    construction_active = "construction_domain" in active
+    finance_active = "finance_function" in active
+    if construction_active and finance_active:
+        has_construction = any(term in title_lower for term in active["construction_domain"])
+        has_finance = any(term in title_lower for term in active["finance_function"])
+        if not (has_construction and has_finance):
+            return False
+
+    return True
+
+
+def compute_relevance_tier(evidence_item, idea_text, keywords, target_audience, forced_subreddits):
+    """
+    Deterministic relevance scoring.
+    Never trust the AI's own relevance_tier label.
+    """
+    evidence_item = evidence_item or {}
+    title = str(evidence_item.get("post_title") or "").lower()
+    proves = str(evidence_item.get("what_it_proves") or "").lower()
+    source = str(evidence_item.get("source") or "").lower()
+    subreddit = str(evidence_item.get("subreddit") or "").lower()
+    source_context = f"{source} {subreddit}".strip()
+
+    idea_words = _meaningful_terms(idea_text, min_len=4)
+    keyword_words = []
+    for kw in keywords or []:
+        keyword_words.extend(_meaningful_terms(kw, min_len=4))
+    core_terms = list(dict.fromkeys(idea_words + keyword_words))
+
+    title_matches = sum(1 for term in core_terms if term and term in title)
+    proves_matches = sum(1 for term in core_terms if term and term in proves)
+    total_matches = title_matches + proves_matches
+    title_group_matches = _matched_semantic_groups(title, idea_text, keywords or [])
+    proves_group_matches = _matched_semantic_groups(proves, idea_text, keywords or [])
+    title_specific = has_idea_specificity(title, idea_text, keywords or [])
+    proves_specific = has_idea_specificity(proves, idea_text, keywords or [])
+
+    buyer_native = any(
+        sub in source_context
+        for sub in _normalize_forced_subreddits(forced_subreddits)
+    )
+
+    hard_noise_signals = [
+        "adhd", "depression", "anxiety",
+        "mental health", "relationship",
+        "teenagers", "books", "gaming",
+        "3d printing", "3d printed", "language technology",
+        "kubernetes", "java", "python tutorial",
+        "machine learning model", "llm",
+        "git", "c++", "agents.md",
+    ]
+    adjacent_category_signals = [
+        "i made $", "passive income",
+        "side hustle", "gumroad seller",
+        "digital products business",
+        "selling a business",
+    ]
+    if any(signal in title for signal in hard_noise_signals) or any(signal in source_context for signal in hard_noise_signals):
+        return "IRRELEVANT"
+
+    audience_lower = str(target_audience or "").lower()
+    audience_words = [
+        word
+        for word in re.findall(r"[A-Za-z0-9_+-]+", audience_lower)
+        if len(word) >= 5
+    ]
+    proves_has_buyer = any(word in proves for word in audience_words)
+
+    direct_pain_signals = [
+        "need help", "looking for", "recommendation", "recommendations",
+        "issue", "problem", "broken", "slow", "expensive", "annoying",
+        "late", "unpaid", "overdue", "chasing", "reminder", "reminders",
+        "follow up", "follow-up", "manual", "tedious", "waste", "hours",
+        "tired of", "sick of", "hate", "frustrated", "struggling",
+    ]
+    has_direct_pain_signal = any(signal in title or signal in proves for signal in direct_pain_signals)
+    has_adjacent_category_signal = any(signal in title or signal in proves for signal in adjacent_category_signals)
+
+    if has_adjacent_category_signal and not buyer_native:
+        return "ADJACENT"
+
+    if title_specific and buyer_native:
+        return "DIRECT"
+    if title_specific:
+        return "DIRECT"
+    if proves_has_buyer and title_specific:
+        return "DIRECT"
+    if proves_specific and has_direct_pain_signal:
+        return "DIRECT"
+
+    if title_matches >= 1 or proves_matches >= 1 or title_group_matches or proves_group_matches:
+        return "ADJACENT"
+
+    return "IRRELEVANT"
+
+
+def _is_direct_evidence(evidence_item, idea_text, keywords, target_audience="", forced_subreddits=None):
+    return compute_relevance_tier(
+        evidence_item,
+        idea_text,
+        keywords or [],
+        target_audience or "",
+        forced_subreddits or [],
+    ) == "DIRECT"
+
+
 def _check_data_quality(posts, source_counts, pass1, pass2, pass3,
-                         platform_warnings=None, idea_text=""):
+                        platform_warnings=None, idea_text="", keywords=None,
+                        target_audience="", forced_subreddits=None):
     """
     Cross-check data quality and detect contradictions between passes.
     Returns a dict with confidence_cap, contradictions list, and warnings list.
@@ -1074,7 +2237,6 @@ def _check_data_quality(posts, source_counts, pass1, pass2, pass3,
     for tier in pricing.get("tiers", []):
         price_str = str(tier.get("price", ""))
         # Extract number from price string
-        import re
         price_match = re.search(r'\$(\d+)', price_str)
         if price_match:
             tier_prices.append(int(price_match.group(1)))
@@ -1092,7 +2254,56 @@ def _check_data_quality(posts, source_counts, pass1, pass2, pass3,
         confidence_cap = min(confidence_cap, 55)
 
     # Contradiction: Few evidence posts cited vs claims of strong validation
-    evidence_count = len(pass1.get("evidence", []))
+    evidence_items = pass1.get("evidence", []) or []
+    evidence_count = len(evidence_items)
+    direct_evidence_count = 0
+    adjacent_evidence_count = 0
+    direct_evidence_breakdown = []
+    for evidence_item in evidence_items:
+        code_tier = compute_relevance_tier(
+            evidence_item,
+            idea_text,
+            keywords or [],
+            target_audience or "",
+            forced_subreddits or [],
+        )
+        direct_evidence_breakdown.append({
+            "title": evidence_item.get("post_title", ""),
+            "code_tier": code_tier,
+            "ai_tier": str(evidence_item.get("ai_relevance_tier") or evidence_item.get("relevance_tier") or "unknown"),
+        })
+        if code_tier == "DIRECT":
+            direct_evidence_count += 1
+        elif code_tier == "ADJACENT":
+            adjacent_evidence_count += 1
+    if direct_evidence_count == 0:
+        confidence_cap = min(confidence_cap, 25)
+        cap_reason = (
+            "ZERO directly relevant posts found. Report is based entirely on adjacent "
+            "signal. Not validation-grade."
+        )
+        warnings.append(
+            "CRITICAL: ZERO directly relevant posts found. Report should be treated as "
+            "hypothesis, not validation."
+        )
+    elif direct_evidence_count < 3:
+        confidence_cap = min(confidence_cap, 35)
+        cap_reason = (
+            f"Only {direct_evidence_count} directly relevant posts. "
+            "Insufficient for reliable verdict."
+        )
+        warnings.append(
+            f"CRITICAL: Only {direct_evidence_count} posts directly address this idea. "
+            "Report should be treated as hypothesis, not validation."
+        )
+    elif direct_evidence_count < 5:
+        confidence_cap = min(confidence_cap, 50)
+        warnings.append(
+            f"THIN DIRECT EVIDENCE: Only {direct_evidence_count} posts directly relevant. "
+            "Broader evidence is adjacent signal only."
+        )
+    elif direct_evidence_count < 10:
+        confidence_cap = min(confidence_cap, 60)
     if evidence_count < 3:
         warnings.append(f"Only {evidence_count} evidence posts cited — insufficient for strong validation claims")
         confidence_cap = min(confidence_cap, 60)
@@ -1150,7 +2361,367 @@ def _check_data_quality(posts, source_counts, pass1, pass2, pass3,
         "contradictions": contradictions,
         "warnings": warnings,
         "platform_warnings": extra_platform_warnings,
+        "direct_evidence_count": direct_evidence_count,
+        "adjacent_evidence_count": adjacent_evidence_count,
+        "direct_evidence_breakdown": direct_evidence_breakdown,
     }
+
+
+def _build_filter_decomposition(keyword_context, decomposition=None):
+    if decomposition:
+        return decomposition
+
+    if isinstance(keyword_context, dict):
+        return keyword_context
+
+    raw_text = str(keyword_context or "")
+    keyword_candidates = []
+    for chunk in re.split(r"[\n,]+", raw_text):
+        clean = chunk.strip()
+        if clean:
+            keyword_candidates.extend([part.strip() for part in clean.split() if part.strip()])
+
+    deduped = []
+    seen = set()
+    for item in keyword_candidates:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+
+    if not deduped:
+        deduped = ["startup", "pain", "workflow"]
+
+    return {
+        "keywords": deduped[:10],
+        "colloquial_keywords": deduped[:5],
+        "subreddits": [],
+        "competitors": [],
+        "audience": "",
+        "pain_hypothesis": raw_text,
+    }
+
+
+def _apply_primary_filter_impl(posts, decomposition, idea_text="", depth_config=None, verbose=True):
+    """Apply the same primary relevance gate used by Phase 3."""
+    from collections import Counter
+
+    MIN_SCORE = 3
+    RELAXED_SCORE = 2
+    core_keywords = [kw.lower() for kw in decomposition.get("keywords", [])]
+    colloquial_keywords = [kw.lower() for kw in decomposition.get("colloquial_keywords", [])]
+    buyer_language_sources = {"reddit", "reddit_comment", "indiehackers", "g2_review", "job_posting"}
+    forced_subreddits = {
+        str(sub).strip().lower().replace("r/", "").replace("/r/", "")
+        for sub in decomposition.get("subreddits", []) or []
+        if str(sub).strip()
+    }
+    niche_text = " ".join(
+        [
+            str(idea_text or ""),
+            str(decomposition.get("audience", "") or ""),
+            str(decomposition.get("pain_hypothesis", "") or ""),
+            " ".join(str(kw or "") for kw in decomposition.get("keywords", []) or []),
+            " ".join(str(kw or "") for kw in decomposition.get("colloquial_keywords", []) or []),
+        ]
+    ).lower()
+    niche_subreddit_map = {
+        "finance": {
+            "triggers": ["accounting", "bookkeeping", "tax", "cpa", "payroll", "finance", "invoice"],
+            "subs": ["accounting", "bookkeeping", "tax", "smallbusiness", "financialplanning", "finance"],
+        },
+        "construction": {
+            "triggers": ["construction", "contractor", "builder", "project manager", "jobsite", "field service"],
+            "subs": ["constructionmanagers", "constructiontech", "construction", "civilengineering", "projectmanagement", "homebuilding"],
+        },
+        "legal": {
+            "triggers": ["legal", "law firm", "lawyer", "attorney", "paralegal", "contract"],
+            "subs": ["lawfirm", "lawyers", "paralegal", "legaltech", "law", "legaladvice"],
+        },
+        "healthcare": {
+            "triggers": ["medical", "healthcare", "clinic", "dentist", "dental", "patient", "doctor"],
+            "subs": ["medicine", "healthit", "dentistry", "privatepractice", "nursing"],
+        },
+        "agency": {
+            "triggers": ["agency", "client work", "marketing agency", "creative agency", "consultancy"],
+            "subs": ["agency", "advertising", "marketing", "freelance", "entrepreneur"],
+        },
+        "real_estate": {
+            "triggers": ["real estate", "realtor", "broker", "property management", "leasing"],
+            "subs": ["realestatetechnology", "realestate", "propertymanagement", "realestateinvesting", "landlord"],
+        },
+        "hr": {
+            "triggers": ["hr", "human resources", "recruiting", "recruiter", "talent acquisition"],
+            "subs": ["humanresources", "recruiting", "recruiters", "askhr"],
+        },
+        "restaurant": {
+            "triggers": ["restaurant", "hospitality", "cafe", "bar", "food service", "kitchen", "menu", "dining", "pos"],
+            "subs": ["restaurantowners", "kitchenconfidential", "restaurant", "foodservice"],
+        },
+        "marketing": {
+            "triggers": ["marketing", "cmo", "attribution", "campaign", "martech", "lead generation", "content marketing"],
+            "subs": ["marketing", "b2bmarketing", "marketingops", "seo", "socialmedia", "ppc"],
+        },
+        "retail": {
+            "triggers": ["retail", "shop owner", "store owner", "merchandising", "ecommerce"],
+            "subs": ["retail", "shopify", "smallbusiness", "ecommerce"],
+        },
+    }
+    topic_native_subreddits = set(forced_subreddits)
+    for config in niche_subreddit_map.values():
+        if any(trigger in niche_text for trigger in config["triggers"]):
+            topic_native_subreddits.update(config["subs"])
+
+    def _source_key(p):
+        raw_source = str(p.get("source") or "").strip().lower()
+        subreddit = str(p.get("subreddit") or "").strip().lower().replace("r/", "").replace("/r/", "")
+        known_reddit_sources = {
+            "reddit",
+            "reddit_comment",
+            "pushshift",
+            "pullpush",
+            "reddit_search",
+        }
+        raw = raw_source or "unknown"
+        if raw.startswith("hackernews"):
+            return "hackernews"
+        if raw.startswith("producthunt"):
+            return "producthunt"
+        if raw.startswith("indiehackers"):
+            return "indiehackers"
+        if raw.startswith("stack"):
+            return "stackoverflow"
+        if raw.startswith("github"):
+            return "githubissues"
+        if raw_source in known_reddit_sources or raw.startswith("reddit") or raw_source.startswith("r/"):
+            return "reddit"
+        if subreddit:
+            return "reddit"
+        return raw or "unknown"
+
+    def _match_count(text, phrases):
+        return sum(1 for phrase in phrases if phrase and phrase in text)
+
+    def _matched_terms(p):
+        raw = p.get("matched_keywords", p.get("matched_phrases", [])) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(item).strip().lower() for item in raw if str(item).strip()]
+
+    def _title_has_core_kw(p):
+        title = (p.get("title", "") or "").lower()
+        return any(re.search(r"\b" + re.escape(kw) + r"\b", title) for kw in core_keywords)
+
+    def _subreddit_key(p):
+        raw = str(p.get("subreddit") or "").strip().lower()
+        return raw.replace("r/", "").replace("/r/", "")
+
+    def _relevance_assessment(p):
+        title = (p.get("title", "") or "").lower()
+        body = " ".join(
+            str(p.get(key) or "").lower()
+            for key in ("selftext", "body", "text", "full_text")
+        )
+        kw_hits = len(_matched_terms(p))
+        score = int(p.get("score", 0) or 0)
+        source = _source_key(p)
+        title_relevant = _title_has_core_kw(p)
+        body_formal_hits = _match_count(body, core_keywords)
+        colloquial_hits = _match_count(f"{title} {body}", colloquial_keywords) if source == "reddit" else 0
+        if source == "reddit":
+            subreddit = _subreddit_key(p)
+            if subreddit in forced_subreddits:
+                if score < RELAXED_SCORE:
+                    return False, "rejected_low_score"
+                if title_relevant or body_formal_hits >= 1 or colloquial_hits >= 1:
+                    return True, "forced_subreddit_match_pass"
+                return False, "rejected_no_match"
+            if subreddit in topic_native_subreddits:
+                if score < RELAXED_SCORE:
+                    return False, "rejected_low_score"
+                if colloquial_hits >= 1 or body_formal_hits >= 1 or kw_hits >= 1:
+                    return True, "body_match_pass"
+                return False, "rejected_no_match"
+            if score >= MIN_SCORE and (title_relevant or kw_hits >= 2):
+                return True, "standard"
+            relaxed_keyword_hits = max(kw_hits, body_formal_hits + colloquial_hits)
+            if score >= RELAXED_SCORE and (
+                relaxed_keyword_hits >= 2 or (relaxed_keyword_hits >= 1 and score >= 10)
+            ):
+                return True, "body_match_pass"
+            if score < RELAXED_SCORE:
+                return False, "rejected_low_score"
+            return False, "rejected_no_match"
+        if score >= MIN_SCORE and (title_relevant or kw_hits >= 2):
+            return True, "standard"
+        if source == "indiehackers":
+            if score >= RELAXED_SCORE and (body_formal_hits >= 1 or kw_hits >= 1):
+                return True, "standard"
+            if score < RELAXED_SCORE:
+                return False, "rejected_low_score"
+            return False, "rejected_no_match"
+        return False, "rejected_no_match" if score >= MIN_SCORE else "rejected_low_score"
+
+    primary_assessments = [_relevance_assessment(p) for p in posts]
+    primary_pre_filtered = [p for p, assessment in zip(posts, primary_assessments) if assessment[0]]
+    pre_filtered = list(primary_pre_filtered)
+    fallback_threshold = depth_config.get("fallback_rescue_threshold", 10) if depth_config else 10
+
+    if len(pre_filtered) < fallback_threshold:
+        fallback_candidates = []
+        for p in posts:
+            source = _source_key(p)
+            score = int(p.get("score", 0) or 0)
+            matched_terms = len(_matched_terms(p))
+            body = " ".join(
+                str(p.get(key) or "").lower()
+                for key in ("selftext", "body", "text", "full_text")
+            )
+            colloquial_hits = _match_count(body, colloquial_keywords) if source == "reddit" else 0
+            body_formal_hits = _match_count(body, core_keywords)
+            min_score = RELAXED_SCORE if source in buyer_language_sources else MIN_SCORE
+            if score >= min_score and (
+                matched_terms >= 1 or body_formal_hits >= 1 or colloquial_hits >= 1
+            ):
+                fallback_candidates.append(p)
+        pre_filtered = (
+            primary_pre_filtered + [p for p in fallback_candidates if p not in primary_pre_filtered]
+        ) or posts
+
+    filter_explanation = (
+        "Primary filter now counts buyer-language body evidence earlier for Reddit/IndieHackers, "
+        "so niche B2B complaint posts do not depend entirely on fallback rescue."
+    )
+    primary_source_counts = Counter(_source_key(p) for p in primary_pre_filtered)
+    rescued_posts = [p for p in pre_filtered if p not in primary_pre_filtered]
+    rescue_source_counts = Counter(_source_key(p) for p in rescued_posts)
+    rescued_count = len(rescued_posts)
+    fallback_mode = "not_needed" if not rescued_count else (
+        "all_posts_emergency" if len(pre_filtered) == len(posts) and not primary_pre_filtered else "score+body-keyword"
+    )
+    reddit_scraped_count = sum(1 for p in posts if _source_key(p) == "reddit")
+    reddit_primary_count = sum(
+        1
+        for p, assessment in zip(posts, primary_assessments)
+        if _source_key(p) == "reddit" and assessment[0]
+    )
+    reddit_detail_counts = Counter(
+        assessment[1]
+        for p, assessment in zip(posts, primary_assessments)
+        if _source_key(p) == "reddit"
+    )
+    rejected_titles_sample = [
+        (p.get("title", "") or "").strip()
+        for p, assessment in sorted(
+            zip(posts, primary_assessments),
+            key=lambda item: int(item[0].get("score", 0) or 0),
+            reverse=True,
+        )
+        if not assessment[0] and (p.get("title", "") or "").strip()
+    ][:10]
+
+    if verbose:
+        print(f"  [Filter] {len(pre_filtered)}/{len(posts)} posts passed the primary relevance gate", flush=True)
+        print(f"  [Filter] {filter_explanation}", flush=True)
+        if primary_source_counts:
+            primary_breakdown = ", ".join(
+                f"{source}={count}" for source, count in sorted(primary_source_counts.items())
+            )
+            print(f"  [Filter] Primary by source: {primary_breakdown}", flush=True)
+        if reddit_scraped_count:
+            print("  [Filter] Reddit pass detail:", flush=True)
+            print(
+                f"    forced_subreddit_match_pass = {reddit_detail_counts.get('forced_subreddit_match_pass', 0)}",
+                flush=True,
+            )
+            print(
+                f"    body_match_pass = {reddit_detail_counts.get('body_match_pass', 0)}",
+                flush=True,
+            )
+            print(
+                f"    rejected_low_score = {reddit_detail_counts.get('rejected_low_score', 0)}",
+                flush=True,
+            )
+            print(
+                f"    rejected_no_match = {reddit_detail_counts.get('rejected_no_match', 0)}",
+                flush=True,
+            )
+            print(
+                f"  [Filter] Reddit pass rate: {reddit_primary_count}/{reddit_scraped_count} scraped "
+                f"({(reddit_primary_count / max(reddit_scraped_count, 1)) * 100:.0f}% - target 35-50%)",
+                flush=True,
+            )
+        rescue_breakdown = ", ".join(
+            f"{source}={count}" for source, count in sorted(rescue_source_counts.items())
+        ) or "none"
+        print(
+            f"  [Filter] Observable summary: primary_pass={len(primary_pre_filtered)}, "
+            f"fallback_rescued={rescued_count}, final_filtered={len(pre_filtered)} "
+            f"({fallback_mode}; {rescue_breakdown})",
+            flush=True,
+        )
+
+    filter_diagnostics = {
+        "primary_pass_count": len(primary_pre_filtered),
+        "fallback_rescued_count": rescued_count,
+        "final_filtered_count": len(pre_filtered),
+        "fallback_mode": fallback_mode,
+        "primary_by_source": dict(primary_source_counts),
+        "fallback_by_source": dict(rescue_source_counts),
+        "reddit_pass_detail": {
+            "scraped_count": reddit_scraped_count,
+            "primary_pass_count": reddit_primary_count,
+            "forced_subreddit_match_pass": reddit_detail_counts.get("forced_subreddit_match_pass", 0),
+            "body_match_pass": reddit_detail_counts.get("body_match_pass", 0),
+            "rejected_low_score": reddit_detail_counts.get("rejected_low_score", 0),
+            "rejected_no_match": reddit_detail_counts.get("rejected_no_match", 0),
+        },
+        "rejected_titles_sample": rejected_titles_sample,
+        "rules": filter_explanation,
+    }
+
+    return pre_filtered, filter_diagnostics
+
+
+def apply_primary_filter(posts, keyword_context, decomposition=None, depth="quick", return_diagnostics=False):
+    """Public wrapper for unit tests and diagnostics."""
+    built_decomposition = _build_filter_decomposition(keyword_context, decomposition=decomposition)
+    filtered, diagnostics = _apply_primary_filter_impl(
+        posts,
+        built_decomposition,
+        idea_text=str(keyword_context or ""),
+        depth_config=get_depth_config(depth),
+        verbose=False,
+    )
+    if return_diagnostics:
+        return filtered, diagnostics
+    return filtered
+
+
+def _normalize_pass1_evidence(pass1, idea_text, keywords, target_audience, forced_subreddits):
+    evidence_items = list((pass1 or {}).get("evidence", []) or [])
+    normalized = []
+    breakdown = []
+    for evidence_item in evidence_items:
+        item = dict(evidence_item or {})
+        ai_tier = str(item.get("relevance_tier") or "unknown").upper().strip() or "UNKNOWN"
+        code_tier = compute_relevance_tier(
+            item,
+            idea_text,
+            keywords or [],
+            target_audience or "",
+            forced_subreddits or [],
+        )
+        item["ai_relevance_tier"] = ai_tier
+        item["relevance_tier"] = code_tier
+        breakdown.append({
+            "title": item.get("post_title", ""),
+            "code_tier": code_tier,
+            "ai_tier": ai_tier,
+        })
+        if code_tier != "IRRELEVANT":
+            normalized.append(item)
+    return normalized, breakdown
 
 
 def phase3_synthesize(idea_text, posts, decomposition, brain, validation_id,
@@ -1225,262 +2796,13 @@ def phase3_synthesize(idea_text, posts, decomposition, brain, validation_id,
         return sampled
 
     # ── Pre-filter: remove noise posts before sampling ──
-    # Trust-quality pass: keep a quality bar, but let buyer-language body evidence
-    # count earlier for Reddit / IndieHackers instead of relying almost entirely on fallback.
-    MIN_SCORE = 3
-    MIN_KW_HITS = 1
-    core_keywords = [kw.lower() for kw in decomposition.get("keywords", [])]
-    RELAXED_SCORE = 2
-    colloquial_keywords = [kw.lower() for kw in decomposition.get("colloquial_keywords", [])]
-    buyer_language_sources = {"reddit", "reddit_comment", "indiehackers"}
-    forced_subreddits = {
-        str(sub).strip().lower().replace("r/", "").replace("/r/", "")
-        for sub in decomposition.get("subreddits", []) or []
-        if str(sub).strip()
-    }
-    niche_text = " ".join(
-        [
-            str(idea_text or ""),
-            str(decomposition.get("audience", "") or ""),
-            str(decomposition.get("pain_hypothesis", "") or ""),
-            " ".join(str(kw or "") for kw in decomposition.get("keywords", []) or []),
-            " ".join(str(kw or "") for kw in decomposition.get("colloquial_keywords", []) or []),
-        ]
-    ).lower()
-    niche_subreddit_map = {
-        "finance": {
-            "triggers": ["accounting", "bookkeeping", "tax", "cpa", "payroll", "finance", "invoice"],
-            "subs": ["accounting", "bookkeeping", "tax", "smallbusiness", "financialplanning", "finance"],
-        },
-        "legal": {
-            "triggers": ["legal", "law firm", "lawyer", "attorney", "paralegal", "contract"],
-            "subs": ["lawfirm", "lawyers", "paralegal", "legaladviceofftopic", "smallbusiness"],
-        },
-        "healthcare": {
-            "triggers": ["medical", "healthcare", "clinic", "dentist", "dental", "patient", "doctor"],
-            "subs": ["medicine", "healthit", "dentistry", "privatepractice", "nursing"],
-        },
-        "agency": {
-            "triggers": ["agency", "client work", "marketing agency", "creative agency", "consultancy"],
-            "subs": ["agency", "advertising", "marketing", "freelance", "entrepreneur"],
-        },
-        "real_estate": {
-            "triggers": ["real estate", "realtor", "broker", "property management", "leasing"],
-            "subs": ["realtors", "realestate", "propertymanagement", "realestateinvesting"],
-        },
-        "hr": {
-            "triggers": ["hr", "human resources", "recruiting", "recruiter", "talent acquisition"],
-            "subs": ["humanresources", "recruiting", "recruiters", "askhr"],
-        },
-        "restaurant": {
-            "triggers": ["restaurant", "hospitality", "cafe", "bar", "food service"],
-            "subs": ["restaurantowners", "kitchenconfidential", "barowners", "smallbusiness"],
-        },
-        "retail": {
-            "triggers": ["retail", "shop owner", "store owner", "merchandising", "ecommerce"],
-            "subs": ["retail", "shopify", "smallbusiness", "ecommerce"],
-        },
-    }
-    topic_native_subreddits = set(forced_subreddits)
-    for config in niche_subreddit_map.values():
-        if any(trigger in niche_text for trigger in config["triggers"]):
-            topic_native_subreddits.update(config["subs"])
-
-    def _source_key(p):
-        raw_source = str(p.get("source") or "").strip().lower()
-        subreddit = str(p.get("subreddit") or "").strip().lower().replace("r/", "").replace("/r/", "")
-        known_reddit_sources = {
-            "reddit",
-            "reddit_comment",
-            "pushshift",
-            "pullpush",
-            "reddit_search",
-        }
-        raw = raw_source or "unknown"
-        if raw.startswith("hackernews"):
-            return "hackernews"
-        if raw.startswith("producthunt"):
-            return "producthunt"
-        if raw.startswith("indiehackers"):
-            return "indiehackers"
-        if raw.startswith("stack"):
-            return "stackoverflow"
-        if raw.startswith("github"):
-            return "githubissues"
-        if raw_source in known_reddit_sources or raw.startswith("reddit") or raw_source.startswith("r/"):
-            return "reddit"
-        if subreddit:
-            return "reddit"
-        return raw or "unknown"
-
-    def _match_count(text, phrases):
-        return sum(1 for phrase in phrases if phrase and phrase in text)
-
-    def _matched_terms(p):
-        raw = p.get("matched_keywords", p.get("matched_phrases", [])) or []
-        if isinstance(raw, str):
-            raw = [raw]
-        return [str(item).strip().lower() for item in raw if str(item).strip()]
-
-    def _title_has_core_kw(p):
-        """Returns True if the post title contains at least one core keyword (word-boundary match)."""
-        title = (p.get("title", "") or "").lower()
-        return any(re.search(r'\b' + re.escape(kw) + r'\b', title) for kw in core_keywords)
-
-    def _subreddit_key(p):
-        raw = str(p.get("subreddit") or "").strip().lower()
-        return raw.replace("r/", "").replace("/r/", "")
-
-    def _relevance_assessment(p):
-        title = (p.get("title", "") or "").lower()
-        body = " ".join(
-            str(p.get(key) or "").lower()
-            for key in ("selftext", "body", "text", "full_text")
-        )
-        kw_hits = len(_matched_terms(p))
-        score = int(p.get("score", 0) or 0)
-        source = _source_key(p)
-        title_relevant = _title_has_core_kw(p)
-        body_formal_hits = _match_count(body, core_keywords)
-        colloquial_hits = _match_count(f"{title} {body}", colloquial_keywords) if source == "reddit" else 0
-        if source == "reddit":
-            subreddit = _subreddit_key(p)
-            if subreddit in forced_subreddits:
-                if score >= RELAXED_SCORE:
-                    return True, "forced_subreddit_pass"
-                return False, "rejected_low_score"
-            if subreddit in topic_native_subreddits:
-                if score < RELAXED_SCORE:
-                    return False, "rejected_low_score"
-                if colloquial_hits >= 1 or body_formal_hits >= 1 or kw_hits >= 1:
-                    return True, "body_match_pass"
-                return False, "rejected_no_match"
-            if score >= MIN_SCORE and (title_relevant or kw_hits >= 2):
-                return True, "standard"
-            if score >= RELAXED_SCORE and (colloquial_hits >= 1 or body_formal_hits >= 1 or kw_hits >= 1):
-                return True, "body_match_pass"
-            if score < RELAXED_SCORE:
-                return False, "rejected_low_score"
-            return False, "rejected_no_match"
-        # All non-Reddit platforms: keep the current threshold unchanged.
-        if score >= MIN_SCORE and (title_relevant or kw_hits >= 2):
-            return True, "standard"
-        if source == "indiehackers":
-            if score >= RELAXED_SCORE and (body_formal_hits >= 1 or kw_hits >= 1):
-                return True, "standard"
-            if score < RELAXED_SCORE:
-                return False, "rejected_low_score"
-            return False, "rejected_no_match"
-        return False, "rejected_no_match" if score >= MIN_SCORE else "rejected_low_score"
-
-    primary_assessments = [_relevance_assessment(p) for p in posts]
-    pre_filtered = [p for p, assessment in zip(posts, primary_assessments) if assessment[0]]
-    primary_pre_filtered = list(pre_filtered)
-    print(f"  [Filter] {len(pre_filtered)}/{len(posts)} posts passed the primary relevance gate", flush=True)
-    fallback_threshold = depth_config.get("fallback_rescue_threshold", 10) if depth_config else 10
-    if len(pre_filtered) < fallback_threshold:
-        # Don't discard everything if filter is too aggressive — fall back to score+body-keyword only
-        fallback_candidates = []
-        for p in posts:
-            source = _source_key(p)
-            score = int(p.get("score", 0) or 0)
-            matched_terms = len(_matched_terms(p))
-            body = " ".join(
-                str(p.get(key) or "").lower()
-                for key in ("selftext", "body", "text", "full_text")
-            )
-            colloquial_hits = _match_count(body, colloquial_keywords) if source == "reddit" else 0
-            body_formal_hits = _match_count(body, core_keywords)
-            min_score = RELAXED_SCORE if source in buyer_language_sources else MIN_SCORE
-            if score >= min_score and (
-                matched_terms >= MIN_KW_HITS or body_formal_hits >= 1 or colloquial_hits >= 1
-            ):
-                fallback_candidates.append(p)
-        pre_filtered = (
-            primary_pre_filtered + [p for p in fallback_candidates if p not in primary_pre_filtered]
-        ) or posts
-        print(f"  [Filter] Fallback: {len(pre_filtered)} posts after score+body-keyword filter", flush=True)
-
-    from collections import Counter
-
-    filter_explanation = (
-        "Primary filter now counts buyer-language body evidence earlier for Reddit/IndieHackers, "
-        "so niche B2B complaint posts do not depend entirely on fallback rescue."
+    pre_filtered, filter_diagnostics = _apply_primary_filter_impl(
+        posts,
+        decomposition,
+        idea_text=idea_text,
+        depth_config=depth_config,
+        verbose=True,
     )
-    primary_source_counts = Counter(_source_key(p) for p in primary_pre_filtered)
-    rescued_posts = [p for p in pre_filtered if p not in primary_pre_filtered]
-    rescue_source_counts = Counter(_source_key(p) for p in rescued_posts)
-    rescued_count = len(rescued_posts)
-    fallback_mode = "not_needed" if not rescued_count else (
-        "all_posts_emergency" if len(pre_filtered) == len(posts) and not primary_pre_filtered else "score+body-keyword"
-    )
-    print(f"  [Filter] {filter_explanation}", flush=True)
-    if primary_source_counts:
-        primary_breakdown = ", ".join(
-            f"{source}={count}" for source, count in sorted(primary_source_counts.items())
-        )
-        print(f"  [Filter] Primary by source: {primary_breakdown}", flush=True)
-    reddit_scraped_count = sum(1 for p in posts if _source_key(p) == "reddit")
-    reddit_primary_count = sum(
-        1
-        for p, assessment in zip(posts, primary_assessments)
-        if _source_key(p) == "reddit" and assessment[0]
-    )
-    reddit_detail_counts = Counter(
-        assessment[1]
-        for p, assessment in zip(posts, primary_assessments)
-        if _source_key(p) == "reddit"
-    )
-    if reddit_scraped_count:
-        print("  [Filter] Reddit pass detail:", flush=True)
-        print(
-            f"    forced_subreddit_pass = {reddit_detail_counts.get('forced_subreddit_pass', 0)}",
-            flush=True,
-        )
-        print(
-            f"    body_match_pass = {reddit_detail_counts.get('body_match_pass', 0)}",
-            flush=True,
-        )
-        print(
-            f"    rejected_low_score = {reddit_detail_counts.get('rejected_low_score', 0)}",
-            flush=True,
-        )
-        print(
-            f"    rejected_no_match = {reddit_detail_counts.get('rejected_no_match', 0)}",
-            flush=True,
-        )
-        print(
-            f"  [Filter] Reddit pass rate: {reddit_primary_count}/{reddit_scraped_count} scraped "
-            f"({(reddit_primary_count / max(reddit_scraped_count, 1)) * 100:.0f}% - target 35-50%)",
-            flush=True,
-        )
-    rescue_breakdown = ", ".join(
-        f"{source}={count}" for source, count in sorted(rescue_source_counts.items())
-    ) or "none"
-    print(
-        f"  [Filter] Observable summary: primary_pass={len(primary_pre_filtered)}, "
-        f"fallback_rescued={rescued_count}, final_filtered={len(pre_filtered)} "
-        f"({fallback_mode}; {rescue_breakdown})",
-        flush=True,
-    )
-
-    filter_diagnostics = {
-        "primary_pass_count": len(primary_pre_filtered),
-        "fallback_rescued_count": rescued_count,
-        "final_filtered_count": len(pre_filtered),
-        "fallback_mode": fallback_mode,
-        "primary_by_source": dict(primary_source_counts),
-        "fallback_by_source": dict(rescue_source_counts),
-        "reddit_pass_detail": {
-            "scraped_count": reddit_scraped_count,
-            "primary_pass_count": reddit_primary_count,
-            "forced_subreddit_pass": reddit_detail_counts.get("forced_subreddit_pass", 0),
-            "body_match_pass": reddit_detail_counts.get("body_match_pass", 0),
-            "rejected_low_score": reddit_detail_counts.get("rejected_low_score", 0),
-            "rejected_no_match": reddit_detail_counts.get("rejected_no_match", 0),
-        },
-        "rules": filter_explanation,
-    }
 
     posts_filtered_count = len(pre_filtered)  # for pipeline UI display
     sampled_posts = _smart_sample(pre_filtered, budget=100)
@@ -1516,15 +2838,48 @@ def phase3_synthesize(idea_text, posts, decomposition, brain, validation_id,
         kw_str = ", ".join(keywords[:10])
         print(f"  [BatchSummarize] {len(all_posts)} posts → {len(batches)} batches of ≤{BATCH_SIZE}", flush=True)
 
-        BATCH_SYSTEM = "You are a market signal extractor. Return ONLY valid compact JSON."
+        BATCH_SYSTEM = """You are a market signal extractor. Return ONLY valid compact JSON.
+
+CRITICAL REJECTION RULE:
+A post is ONLY relevant if it directly mentions:
+- The specific problem this idea solves, OR
+- The specific buyer type (by name/role), OR
+- A competitor or alternative being used/complained about
+- An explicit willingness to pay for this type of solution
+
+Do NOT use a post as evidence if:
+- It mentions a related technology but not the problem
+- It's from a wrong audience (developer posts for non-dev ideas)
+- It requires 2+ logical steps to connect to the idea
+- The connection is "this shows general interest in the space"
+
+If you find yourself writing "this could indicate..." or "this suggests general interest in..." — DO NOT include it.
+If no directly relevant pain quotes, WTP signals, or competitor mentions exist in this batch, return empty arrays for those fields.
+
+CRITICAL: Each post now includes [source/subreddit] context.
+Use this to assess audience relevance.
+
+REJECT a post for pain_quotes/wtp_signals if:
+- The poster is clearly NOT the target buyer (developer post for non-dev idea, etc.)
+- The pain is generic and not specific to the exact problem this idea solves
+- The WTP signal is for a different product category
+
+Only extract signals where the poster is plausibly the target buyer AND the signal is specifically about the exact problem, not an adjacent topic.
+"""
 
         def _run_batch(batch_posts, batch_idx):
             lines = []
             for p in batch_posts:
                 title = (p.get("title", "") or "")[:150]
-                snippet = (p.get("selftext", "") or p.get("text", "") or "")[:200]
+                snippet = (p.get("selftext", "") or p.get("body", "") or p.get("text", "") or p.get("full_text", "") or "")[:200]
                 score = p.get("score", 0)
-                lines.append(f"[{score}pts] {title}\n{snippet}")
+                source = str(p.get("source") or "").strip().lower() or "unknown"
+                subreddit = str(p.get("subreddit") or "").strip().replace("r/", "").replace("/r/", "")
+                if source.startswith("reddit") or subreddit:
+                    context_label = f"reddit/r/{subreddit or 'na'}"
+                else:
+                    context_label = f"{source}/na"
+                lines.append(f"[{score}] [{context_label}] {title}: {snippet}")
             posts_text = "\n---\n".join(lines)
             prompt = f"""Idea keywords: {kw_str}
 
@@ -1647,8 +3002,20 @@ Analyze the MARKET signal. Find pain validation, WTP signals, and cite specific 
     try:
         pass1_raw = brain.single_call(pass1_prompt, PASS1_SYSTEM)
         pass1 = extract_json(pass1_raw)
+        normalized_evidence, code_breakdown = _normalize_pass1_evidence(
+            pass1,
+            idea_text,
+            decomposition.get("keywords", []),
+            decomposition.get("audience", ""),
+            decomposition.get("subreddits", []),
+        )
+        dropped_irrelevant = max(0, len(pass1.get("evidence", []) or []) - len(normalized_evidence))
+        pass1["evidence"] = normalized_evidence
+        pass1["_code_evidence_breakdown"] = code_breakdown
         evidence_count = len(pass1.get("evidence", []))
         print(f"  [✓] Pass 1 done: pain_validated={pass1.get('pain_validated')}, {evidence_count} evidence posts")
+        if dropped_irrelevant:
+            print(f"  [Evidence] Dropped {dropped_irrelevant} IRRELEVANT Pass 1 evidence items via code scoring")
     except Exception as e:
         print(f"  [!] Pass 1 failed after routing all available models: {e}")
         pass1 = {"pain_validated": False, "pain_description": "Analysis failed", "evidence": []}
@@ -1752,6 +3119,9 @@ Create the launch roadmap, revenue projections, risk matrix, and first 10 custom
         pass3,
         platform_warnings=kwargs.get("platform_warnings", []),
         idea_text=idea_text,
+        keywords=decomposition.get("keywords", []),
+        target_audience=decomposition.get("audience", ""),
+        forced_subreddits=decomposition.get("subreddits", []),
     )
     print(f"\n  ── Data Quality Check ──")
     print(f"  [Q] Post count: {len(posts)} (threshold: 20 for full confidence)")
@@ -1859,7 +3229,10 @@ Based on ALL analysis, deliver your FINAL VERDICT. Be honest and data-driven. If
 
     total_boost = min(15, boost)
     if total_boost > 0:
-        boost_ceiling = min(85, data_quality["confidence_cap"] + 10)
+        if data_quality.get("direct_evidence_count", 0) < 5:
+            boost_ceiling = data_quality["confidence_cap"]
+        else:
+            boost_ceiling = min(85, data_quality["confidence_cap"] + 10)
         boosted = min(capped_confidence + total_boost, boost_ceiling)
         print(
             f"  [Confidence] Cap={capped_confidence}% + Boost={total_boost}% "
@@ -1951,6 +3324,8 @@ Based on ALL analysis, deliver your FINAL VERDICT. Be honest and data-driven. If
         "batches_succeeded": (batch_signals or {}).get("batches_succeeded", 0) if 'batch_signals' in dir() else 0,
         "batches_total": (batch_signals or {}).get("batches_total", 0) if 'batch_signals' in dir() else 0,
         "data_sources": source_counts if 'source_counts' in dir() else {},
+        "direct_evidence_count": data_quality.get("direct_evidence_count", 0),
+        "adjacent_evidence_count": data_quality.get("adjacent_evidence_count", 0),
     }
 
     # Risk fallback: Pass 3 often truncates on Groq 8K limit — use debate risks if empty
@@ -2061,7 +3436,62 @@ Based on ALL analysis, deliver your FINAL VERDICT. Be honest and data-driven. If
         "contradictions": data_quality["contradictions"],
         "warnings": data_quality["warnings"],
         "platform_warnings": kwargs.get("platform_warnings", []) + data_quality.get("platform_warnings", []),
+        "direct_evidence_count": data_quality.get("direct_evidence_count", 0),
+        "adjacent_evidence_count": data_quality.get("adjacent_evidence_count", 0),
     }
+
+    report["_audit"] = {
+        "idea_icp": str((kwargs.get("scrape_audit", {}) or {}).get("idea_icp", "")),
+        "forced_subreddits": list((kwargs.get("scrape_audit", {}) or {}).get("forced_subreddits", [])),
+        "discovered_subreddits": list((kwargs.get("scrape_audit", {}) or {}).get("discovered_subreddits", [])),
+        "subreddit_post_counts": dict((kwargs.get("scrape_audit", {}) or {}).get("subreddit_post_counts", {})),
+        "raw_pain_quotes": list((batch_signals or {}).get("pain_quotes", [])) if 'batch_signals' in dir() else [],
+        "raw_wtp_signals": list((batch_signals or {}).get("wtp_signals", [])) if 'batch_signals' in dir() else [],
+        "filter_rejected_sample": list((filter_diagnostics or {}).get("rejected_titles_sample", [])) if 'filter_diagnostics' in dir() else [],
+        "direct_evidence_count": data_quality.get("direct_evidence_count", 0),
+        "adjacent_evidence_count": data_quality.get("adjacent_evidence_count", 0),
+        "direct_evidence_breakdown": list(pass1.get("_code_evidence_breakdown", data_quality.get("direct_evidence_breakdown", []))),
+    }
+
+    direct_count = int(data_quality.get("direct_evidence_count", 0) or 0)
+    insufficient_direct_message = (
+        f"Only {direct_count} posts directly address this idea. Strategy sections (ICP, pricing, GTM) "
+        f"are based on adjacent data and should not be trusted. Validate with direct buyer interviews first."
+    )
+    force_insufficient_direct = direct_count < 3 and not kwargs.get("test_mode", False)
+    report["_quality_flags"] = {
+        "insufficient_direct_evidence": direct_count < 3,
+        "direct_evidence_count": direct_count,
+        "suppress_strategy_sections": force_insufficient_direct,
+        "message": insufficient_direct_message,
+    }
+    if force_insufficient_direct:
+        report["verdict"] = "INSUFFICIENT DATA"
+        hard_cap = 25 if direct_count == 0 else 35
+        report["confidence"] = min(int(report.get("confidence", 0) or 0), hard_cap)
+        report["executive_summary"] = insufficient_direct_message
+        report["market_analysis"]["pain_validated"] = False
+        report["market_analysis"]["pain_description"] = insufficient_direct_message
+        report["ideal_customer_profile"] = {"speculative": True, "message": insufficient_direct_message}
+        report["competition_landscape"] = {
+            "speculative": True,
+            "message": insufficient_direct_message,
+            "market_saturation": report.get("competition_landscape", {}).get("market_saturation", ""),
+            "direct_competitors": report.get("competition_landscape", {}).get("direct_competitors", []),
+        }
+        report["pricing_strategy"] = {"speculative": True, "message": insufficient_direct_message}
+        report["monetization_channels"] = []
+        report["launch_roadmap"] = []
+        report["revenue_projections"] = {}
+        report["financial_reality"] = {"speculative": True, "message": insufficient_direct_message}
+        report["risk_matrix"] = []
+        report["first_10_customers_strategy"] = {"speculative": True, "message": insufficient_direct_message}
+        report["mvp_features"] = []
+        report["cut_features"] = []
+        report["data_quality"]["confidence_was_capped"] = True
+        report["data_quality"]["cap_reason"] = insufficient_direct_message
+        report["data_quality"]["warnings"] = list(report["data_quality"].get("warnings", [])) + [insufficient_direct_message]
+        print(f"  [Q] Forcing verdict to INSUFFICIENT DATA (direct evidence={direct_count})")
 
     verdict = report["verdict"]
     confidence = report["confidence"]
@@ -2130,12 +3560,95 @@ Based on ALL analysis, deliver your FINAL VERDICT. Be honest and data-driven. If
     return report
 
 
+def run_synthesis_pass1(
+    brain,
+    posts,
+    idea,
+    decomposition=None,
+    validation_id="test-pass1",
+    depth="quick",
+    source_counts=None,
+    intel=None,
+    test_mode=True,
+):
+    """Run the first synthesis pass only, using the same prompt contract as Phase 3."""
+    depth_config = get_depth_config(depth)
+    decomposition = _build_filter_decomposition(idea, decomposition=decomposition)
+    source_counts = source_counts or {}
+    intel = intel or {}
+
+    with _validation_write_mode(test_mode):
+        filtered_posts, _ = _apply_primary_filter_impl(
+            posts,
+            decomposition,
+            idea_text=idea,
+            depth_config=depth_config,
+            verbose=False,
+        )
+        candidate_posts = filtered_posts or list(posts)
+        sampled_posts = candidate_posts[: min(20, len(candidate_posts))]
+        post_summaries = []
+        for post in sampled_posts:
+            post_summaries.append({
+                "title": post.get("title", "")[:200],
+                "source": post.get("source", post.get("subreddit", "unknown")),
+                "subreddit": post.get("subreddit", ""),
+                "score": post.get("score", 0),
+                "comments": post.get("num_comments", 0),
+                "text_snippet": (post.get("selftext", "") or post.get("text", "") or "")[:300],
+            })
+
+        derived_sources = dict(source_counts)
+        if not derived_sources:
+            for post in candidate_posts:
+                source = str(post.get("source") or post.get("subreddit") or "unknown").lower()
+                derived_sources[source] = derived_sources.get(source, 0) + 1
+
+        platforms_used = len([name for name, count in derived_sources.items() if count > 0])
+        source_summary = ", ".join(
+            f"{name}: {count} posts" for name, count in derived_sources.items() if count > 0
+        ) or "unknown sources"
+        posts_block = f"TOP {len(post_summaries)} POSTS:\n{json.dumps(post_summaries, indent=2)}"
+        context_block = f"""IDEA: {idea}
+
+TARGET AUDIENCE: {decomposition.get('audience', '')}
+PAIN HYPOTHESIS: {decomposition.get('pain_hypothesis', '')}
+COMPETITORS: {', '.join(decomposition.get('competitors', []))}
+KEYWORDS: {', '.join(decomposition.get('keywords', []))}
+
+DATA: {len(candidate_posts)} filtered posts (from {len(posts)} total supplied) across {platforms_used} platforms ({source_summary})
+"""
+        if intel.get("trend_prompt"):
+            context_block += intel["trend_prompt"] + "\n"
+        if intel.get("comp_prompt"):
+            context_block += intel["comp_prompt"] + "\n"
+
+        pass1_prompt = f"""{context_block}
+
+{posts_block}
+
+Analyze the MARKET signal. Find pain validation, WTP signals, and cite specific evidence posts."""
+        pass1_raw = brain.single_call(pass1_prompt, PASS1_SYSTEM)
+        return extract_json(pass1_raw)
+
+
 # ═══════════════════════════════════════════════════════
 # MAIN PIPELINE
 # ═══════════════════════════════════════════════════════
 
-def validate_idea(validation_id: str, idea_text: str, user_id: str = "", depth: str = "quick"):
+def validate_idea(
+    validation_id: str = "",
+    idea_text: str = "",
+    user_id: str = "",
+    depth: str = "quick",
+    test_mode: bool = False,
+    brain=None,
+    configs=None,
+    **kwargs,
+):
     """Full 3-phase validation pipeline with multi-model debate."""
+    idea_text = kwargs.pop("idea", idea_text)
+    validation_id = kwargs.pop("validation_id", validation_id) or ("test-validation" if test_mode else "cli-test")
     depth_config = get_depth_config(depth)
     print(f"\n{'='*50}")
     print(f"  IDEA VALIDATION {validation_id}")
@@ -2143,142 +3656,119 @@ def validate_idea(validation_id: str, idea_text: str, user_id: str = "", depth: 
     print(f"  Idea: {idea_text[:100]}...")
     print(f"{'='*50}")
     log_depth_config(depth_config)
+    _log_optional_source_config()
     print()
 
-    try:
-        # Load user's AI configs from Supabase
-        configs = []
-        if user_id:
-            configs = get_user_ai_configs(user_id)
-            print(f"  [>] Found {len(configs)} AI configs for user")
+    with _validation_write_mode(test_mode):
+        try:
+            resolved_configs = list(configs or [])
+            if not brain:
+                if user_id:
+                    print(f"  [>] Loading AI configs for user {user_id}")
+                resolved_configs = load_validation_configs(user_id=user_id, test_mode=test_mode)
+                if user_id:
+                    print(f"  [>] Found {len(resolved_configs)} AI configs for user")
+                elif not resolved_configs:
+                    print("  [!] No user AI configs found, checking env vars...")
 
-        if not configs:
-            # Fallback: check env vars for backward compatibility
-            print("  [!] No user AI configs found, checking env vars...")
-            fallback_configs = []
-            if os.environ.get("GEMINI_API_KEY"):
-                fallback_configs.append({
-                    "provider": "gemini",
-                    "api_key": os.environ["GEMINI_API_KEY"],
-                    "selected_model": "gemini-2.0-flash",
-                    "is_active": True,
-                    "priority": 1,
-                })
-            if os.environ.get("GROQ_API_KEY"):
-                fallback_configs.append({
-                    "provider": "groq",
-                    "api_key": os.environ["GROQ_API_KEY"],
-                    "selected_model": "llama-3.3-70b-versatile",
-                    "is_active": True,
-                    "priority": 2,
-                })
-            if os.environ.get("OPENAI_API_KEY"):
-                fallback_configs.append({
-                    "provider": "openai",
-                    "api_key": os.environ["OPENAI_API_KEY"],
-                    "selected_model": "gpt-4o",
-                    "is_active": True,
-                    "priority": 3,
-                })
-            if os.environ.get("OPENROUTER_API_KEY"):
-                fallback_configs.append({
-                    "provider": "openrouter",
-                    "api_key": os.environ["OPENROUTER_API_KEY"],
-                    "selected_model": "openrouter/deepseek/deepseek-r1",
-                    "is_active": True,
-                    "priority": 4,
-                })
-            configs = fallback_configs
+                if not resolved_configs:
+                    diagnostics = []
+                    if not os.environ.get("SUPABASE_URL"):
+                        diagnostics.append("SUPABASE_URL missing")
+                    if not (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")):
+                        diagnostics.append("SUPABASE service key missing")
+                    if not os.environ.get("AI_ENCRYPTION_KEY"):
+                        diagnostics.append("AI_ENCRYPTION_KEY missing")
 
-        if not configs:
-            diagnostics = []
-            if not os.environ.get("SUPABASE_URL"):
-                diagnostics.append("SUPABASE_URL missing")
-            if not (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")):
-                diagnostics.append("SUPABASE service key missing")
-            if not os.environ.get("AI_ENCRYPTION_KEY"):
-                diagnostics.append("AI_ENCRYPTION_KEY missing")
+                    detail = f" Diagnostics: {', '.join(diagnostics)}." if diagnostics else ""
+                    raise Exception(
+                        "No AI models configured or the worker is using stale settings. "
+                        "Restart `npm run worker` after saving AI models." + detail
+                    )
 
-            detail = f" Diagnostics: {', '.join(diagnostics)}." if diagnostics else ""
-            raise Exception(
-                "No AI models configured or the worker is using stale settings. "
-                "Restart `npm run worker` after saving AI models." + detail
+                brain = AIBrain(resolved_configs)
+            else:
+                resolved_configs = list(getattr(brain, "configs", resolved_configs) or resolved_configs)
+
+            # Phase 1: Decompose idea
+            decomposition = phase1_decompose(idea_text, brain, validation_id, depth_config=depth_config)
+
+            # Dynamic subreddit expansion for future scraper coverage
+            if user_id and not test_mode:
+                try:
+                    new_subs = discover_subreddits(
+                        decomposition.get("keywords", [])[:5],
+                        forced_subreddits=decomposition.get("subreddits", []),
+                        idea_text=idea_text,
+                    )
+                    if new_subs:
+                        requests.post(
+                            f"{SUPABASE_URL}/rest/v1/user_requested_subreddits",
+                            headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                            json=[
+                                {"subreddit": s, "requested_by": user_id, "keywords": decomposition.get("keywords", [])[:5]}
+                                for s in new_subs
+                            ],
+                            timeout=10,
+                        )
+                        print(f"  [Subs] Discovered {len(new_subs)} new subreddits: {new_subs}")
+                except Exception as e:
+                    print(f"  [Subs] Discovery failed: {e}")
+
+            # Phase 2: Scrape ALL platforms
+            phase2_result = phase2_scrape(
+                decomposition["keywords"],
+                decomposition.get("colloquial_keywords", []),
+                decomposition.get("subreddits", []),
+                validation_id,
+                depth_config=depth_config,
+                idea_text=idea_text,
+                audience=decomposition.get("audience", ""),
+                known_competitors=decomposition.get("competitors", []),
             )
+            if len(phase2_result) == 4:
+                posts, source_counts, platform_warnings, scrape_audit = phase2_result
+            else:
+                posts, source_counts, platform_warnings = phase2_result
+                scrape_audit = {"discovered_subreddits": [], "subreddit_post_counts": {}}
 
-        # Initialize the multi-model brain
-        brain = AIBrain(configs)
+            early_competitor_names = []
+            early_competitor_complaints = []
+            if DEATHWATCH_AVAILABLE and not test_mode:
+                try:
+                    early_competitor_names = sorted({
+                        str(name).strip()
+                        for name in decomposition.get("competitors", [])
+                        if str(name).strip()
+                    })
+                    if early_competitor_names:
+                        print(
+                            f"  [Deathwatch] Early competition scan using "
+                            f"{len(early_competitor_names)} competitor hint(s): {early_competitor_names[:5]}"
+                        )
+                        early_competitor_complaints = scan_for_complaints(posts, early_competitor_names)
+                except Exception as e:
+                    print(f"  [Deathwatch] Early scan skipped: {e}")
 
-        # Phase 1: Decompose idea
-        decomposition = phase1_decompose(idea_text, brain, validation_id, depth_config=depth_config)
+            # Phase 2b: Intelligence analysis (Trends + Competition)
+            complaint_competitors = sorted({
+                comp
+                for complaint in early_competitor_complaints
+                for comp in complaint.get("competitors_mentioned", [])
+            })
+            intel = phase2b_intelligence(
+                decomposition["keywords"],
+                validation_id,
+                idea_text=idea_text,
+                known_competitors=early_competitor_names,
+                complaint_count=len(early_competitor_complaints),
+                complaint_competitors=complaint_competitors,
+            )
+            if early_competitor_complaints:
+                intel["competitor_complaints"] = early_competitor_complaints[:10]
 
-        # Dynamic subreddit expansion for future scraper coverage
-        if user_id:
-            try:
-                new_subs = discover_subreddits(decomposition.get("keywords", [])[:5])
-                if new_subs:
-                    requests.post(
-                        f"{SUPABASE_URL}/rest/v1/user_requested_subreddits",
-                        headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
-                        json=[
-                            {"subreddit": s, "requested_by": user_id, "keywords": decomposition.get("keywords", [])[:5]}
-                            for s in new_subs
-                        ],
-                        timeout=10,
-                    )
-                    print(f"  [Subs] Discovered {len(new_subs)} new subreddits: {new_subs}")
-            except Exception as e:
-                print(f"  [Subs] Discovery failed: {e}")
-
-        # Phase 2: Scrape ALL platforms
-        posts, source_counts, platform_warnings = phase2_scrape(
-            decomposition["keywords"],
-            decomposition.get("colloquial_keywords", []),
-            decomposition.get("subreddits", []),
-            validation_id,
-            depth_config=depth_config,
-        )
-
-        early_competitor_names = []
-        early_competitor_complaints = []
-        if DEATHWATCH_AVAILABLE:
-            try:
-                early_competitor_names = sorted({
-                    str(name).strip()
-                    for name in decomposition.get("competitors", [])
-                    if str(name).strip()
-                })
-                if early_competitor_names:
-                    print(
-                        f"  [Deathwatch] Early competition scan using "
-                        f"{len(early_competitor_names)} competitor hint(s): {early_competitor_names[:5]}"
-                    )
-                    early_competitor_complaints = scan_for_complaints(posts, early_competitor_names)
-            except Exception as e:
-                print(f"  [Deathwatch] Early scan skipped: {e}")
-
-        # Phase 2b: Intelligence analysis (Trends + Competition)
-        complaint_competitors = sorted({
-            comp
-            for complaint in early_competitor_complaints
-            for comp in complaint.get("competitors_mentioned", [])
-        })
-        intel = phase2b_intelligence(
-            decomposition["keywords"],
-            validation_id,
-            idea_text=idea_text,
-            known_competitors=early_competitor_names,
-            complaint_count=len(early_competitor_complaints),
-            complaint_competitors=complaint_competitors,
-        )
-        if early_competitor_complaints:
-            intel["competitor_complaints"] = early_competitor_complaints[:10]
-
-        if len(posts) == 0:
-            update_validation(validation_id, {
-                "status": "done",
-                "verdict": "INSUFFICIENT DATA",
-                "confidence": 0,
-                "report": json.dumps({
+            if len(posts) == 0:
+                insufficient_report = {
                     "verdict": "INSUFFICIENT DATA",
                     "confidence": 0,
                     "summary": "No relevant posts found across any platform. Try rephrasing your idea or the market may be too niche.",
@@ -2290,79 +3780,87 @@ def validate_idea(validation_id: str, idea_text: str, user_id: str = "", depth: 
                     "platform_warnings": platform_warnings,
                     "trends_data": intel.get("trends"),
                     "competition_data": intel.get("competition"),
-                    "models_used": [f"{c['provider']}/{c['selected_model']}" for c in configs],
-                    "debate_mode": len(configs) > 1,
-                }),
-                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
-            print("\n  [!] No posts found — insufficient data for validation")
-            return
+                    "models_used": [f"{c['provider']}/{c['selected_model']}" for c in resolved_configs],
+                    "debate_mode": len(resolved_configs) > 1,
+                }
+                update_validation(validation_id, {
+                    "status": "done",
+                    "verdict": "INSUFFICIENT DATA",
+                    "confidence": 0,
+                    "report": json.dumps(insufficient_report),
+                    "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
+                print("\n  [!] No posts found — insufficient data for validation")
+                return insufficient_report
 
-        # Phase 3: Synthesize via multi-model debate (with ALL intelligence)
-        report = phase3_synthesize(idea_text, posts, decomposition, brain, validation_id,
-                                   source_counts=source_counts, intel=intel,
-                                   platform_warnings=platform_warnings,
-                                   depth_config=depth_config)
+            # Phase 3: Synthesize via multi-model debate (with ALL intelligence)
+            report = phase3_synthesize(idea_text, posts, decomposition, brain, validation_id,
+                                       source_counts=source_counts, intel=intel,
+                                       platform_warnings=platform_warnings,
+                                       scrape_audit=scrape_audit,
+                                       depth_config=depth_config,
+                                       test_mode=test_mode)
 
-        # ── Inject depth metadata into report ──
-        report["depth_metadata"] = {
-            "mode": depth_config["mode"],
-            "label": depth_config["label"],
-            "reddit_lookback": depth_config["reddit_duration"],
-            "evidence_sample_budget": depth_config["evidence_sample_budget"],
-            "sources_queried": list(source_counts.keys()),
-            "posts_scraped": sum(source_counts.values()),
-            "posts_analyzed": len(posts),
-        }
+            # ── Inject depth metadata into report ──
+            report["depth_metadata"] = {
+                "mode": depth_config["mode"],
+                "label": depth_config["label"],
+                "reddit_lookback": depth_config["reddit_duration"],
+                "evidence_sample_budget": depth_config["evidence_sample_budget"],
+                "sources_queried": list(source_counts.keys()),
+                "posts_scraped": sum(source_counts.values()),
+                "posts_analyzed": len(posts),
+            }
 
-        # ── Post-Phase: Pain Stream alert (auto-create for return visits) ──
-        if PAIN_STREAM_AVAILABLE and user_id:
+            # ── Post-Phase: Pain Stream alert (auto-create for return visits) ──
+            if PAIN_STREAM_AVAILABLE and user_id and not test_mode:
+                try:
+                    kws = decomposition.get("keywords", [])[:5]
+                    if kws:
+                        create_pain_alert(
+                            user_id=user_id,
+                            validation_id=validation_id,
+                            keywords=kws,
+                            subreddits=[p.get("subreddit", "") for p in posts[:20] if p.get("subreddit")],
+                        )
+                except Exception as e:
+                    print(f"  [PainStream] Alert creation skipped: {e}")
+
+            # ── Post-Phase: Competitor Deathwatch scan ──
+            if DEATHWATCH_AVAILABLE and not test_mode:
+                try:
+                    comp_names = list(early_competitor_names)
+                    comp_landscape = report.get("competition_landscape", {})
+                    for comp in comp_landscape.get("direct_competitors", []):
+                        name = comp.get("name", "") if isinstance(comp, dict) else str(comp)
+                        if name:
+                            comp_names.append(name)
+                    comp_names = sorted({str(name).strip() for name in comp_names if str(name).strip()})
+                    if comp_names:
+                        complaints = scan_for_complaints(posts, comp_names)
+                        if complaints:
+                            save_complaints(complaints)
+                            report["competitor_complaints"] = complaints[:10]
+                    elif early_competitor_complaints:
+                        report["competitor_complaints"] = early_competitor_complaints[:10]
+                except Exception as e:
+                    print(f"  [Deathwatch] Scan skipped: {e}")
+
+            print("\n  [✓] Validation complete!")
+            return report
+
+        except Exception as e:
+            print(f"\n  [✗] PIPELINE ERROR: {e}")
+            traceback.print_exc()
             try:
-                kws = decomposition.get("keywords", [])[:5]
-                if kws:
-                    create_pain_alert(
-                        user_id=user_id,
-                        validation_id=validation_id,
-                        keywords=kws,
-                        subreddits=[p.get("subreddit", "") for p in posts[:20] if p.get("subreddit")],
-                    )
-            except Exception as e:
-                print(f"  [PainStream] Alert creation skipped: {e}")
-
-        # ── Post-Phase: Competitor Deathwatch scan ──
-        if DEATHWATCH_AVAILABLE:
-            try:
-                comp_names = list(early_competitor_names)
-                comp_landscape = report.get("competition_landscape", {})
-                for comp in comp_landscape.get("direct_competitors", []):
-                    name = comp.get("name", "") if isinstance(comp, dict) else str(comp)
-                    if name:
-                        comp_names.append(name)
-                comp_names = sorted({str(name).strip() for name in comp_names if str(name).strip()})
-                if comp_names:
-                    complaints = scan_for_complaints(posts, comp_names)
-                    if complaints:
-                        save_complaints(complaints)
-                        report["competitor_complaints"] = complaints[:10]
-                elif early_competitor_complaints:
-                    report["competitor_complaints"] = early_competitor_complaints[:10]
-            except Exception as e:
-                print(f"  [Deathwatch] Scan skipped: {e}")
-
-        print("\n  [✓] Validation complete!")
-
-    except Exception as e:
-        print(f"\n  [✗] PIPELINE ERROR: {e}")
-        traceback.print_exc()
-        try:
-            update_validation(validation_id, {
-                "status": "failed",
-                "error": str(e),
-                "report": json.dumps({"error": str(e), "failure_stage": "validation"}),
-                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
-        except Exception as persist_error:
-            print(f"  [!] Failed to persist terminal validation error: {persist_error}")
+                update_validation(validation_id, {
+                    "status": "failed",
+                    "error": str(e),
+                    "report": json.dumps({"error": str(e), "failure_stage": "validation"}),
+                    "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
+            except Exception as persist_error:
+                print(f"  [!] Failed to persist terminal validation error: {persist_error}")
             raise
 
 

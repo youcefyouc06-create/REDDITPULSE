@@ -10,6 +10,7 @@ import re
 import time
 import random
 import requests
+from collections import Counter
 from datetime import datetime, timezone
 
 # ── Try to import PRAW-based authenticated scraper ──
@@ -238,20 +239,86 @@ TOPIC_SUBREDDITS = {
     },
 }
 
+ALWAYS_ADD = [
+    "smallbusiness",
+    "Entrepreneur",
+    "startups",
+]
 
-def _select_subreddits(keywords: list, forced_subreddits: list | None = None) -> list:
+DEV_ONLY_SUBREDDITS = {
+    "MachineLearning",
+    "OpenAI",
+    "ChatGPT",
+    "webdev",
+    "selfhosted",
+    "datascience",
+    "LocalLLaMA",
+}
+
+DEV_TARGET_TERMS = [
+    "api",
+    "developer",
+    "code",
+    "saas platform",
+    "machine learning",
+    "ai model",
+    "developer tool",
+    "engineering",
+    "programming",
+    "software engineer",
+]
+
+NOISE_SUBREDDITS_FOR_NON_DEV = {
+    "artificial", "languagetechnology", "machinelearning",
+    "localllama", "openai", "chatgpt", "datascience",
+    "learnmachinelearning", "deeplearning", "singularity",
+    "adhd", "depression", "anxiety", "teenagers",
+    "books", "gaming", "3dprinting", "selfhosted", "homelab",
+}
+
+
+def _is_dev_targeted(idea_text: str = "", keywords: list | None = None) -> bool:
+    haystack = " ".join([str(idea_text or "")] + [str(kw or "") for kw in (keywords or [])]).lower()
+    return any(term in haystack for term in DEV_TARGET_TERMS)
+
+
+def filter_subreddits_by_icp(subreddits, icp_category):
+    if icp_category == "DEV_TOOL":
+        return list(subreddits or [])
+
+    filtered = [
+        sub for sub in (subreddits or [])
+        if str(sub or "").strip().lower() not in NOISE_SUBREDDITS_FOR_NON_DEV
+    ]
+    removed = {
+        str(sub).strip()
+        for sub in (subreddits or [])
+        if str(sub or "").strip() and str(sub or "").strip().lower() in NOISE_SUBREDDITS_FOR_NON_DEV
+    }
+    if removed:
+        print(f"  [ICP Filter] Removed {len(removed)} noise subs for {icp_category}: {sorted(removed)}")
+    return filtered
+
+
+def _select_subreddits(
+    keywords: list,
+    forced_subreddits: list | None = None,
+    idea_text: str = "",
+) -> list:
     """Pick subreddits based on which topic triggers match the keywords."""
     selected = set(CORE_SUBREDDITS)
+    selected.update(ALWAYS_ADD)
     kw_text = " ".join(kw.lower() for kw in keywords)
+    dev_targeted = _is_dev_targeted(idea_text=idea_text, keywords=keywords)
 
     for topic, data in TOPIC_SUBREDDITS.items():
         for trigger in data["triggers"]:
             if trigger.lower() in kw_text:
-                selected.update(data["subs"])
+                for sub in data["subs"]:
+                    if sub in DEV_ONLY_SUBREDDITS and not dev_targeted:
+                        continue
+                    selected.add(sub)
                 break  # one trigger match is enough
-
-    # Always add the general subs
-    selected.update(["webdev", "freelance", "ecommerce", "marketing"])
 
     for sub in forced_subreddits or []:
         clean = str(sub).strip().replace("r/", "").replace("/r/", "")
@@ -263,10 +330,18 @@ def _select_subreddits(keywords: list, forced_subreddits: list | None = None) ->
     return result
 
 
-def discover_subreddits(keywords: list, forced_subreddits: list | None = None) -> list:
+def discover_subreddits(
+    keywords: list,
+    forced_subreddits: list | None = None,
+    idea_text: str = "",
+) -> list:
     """Discover additional subreddits for a keyword set beyond the core defaults."""
-    selected = _select_subreddits(keywords, forced_subreddits=forced_subreddits)
-    extras = [sub for sub in selected if sub not in CORE_SUBREDDITS]
+    selected = _select_subreddits(
+        keywords,
+        forced_subreddits=forced_subreddits,
+        idea_text=idea_text,
+    )
+    extras = [sub for sub in selected if sub not in CORE_SUBREDDITS and sub not in ALWAYS_ADD]
     return extras[:20]
 
 
@@ -276,6 +351,9 @@ def run_keyword_scan(
     on_progress=None,
     forced_subreddits: list | None = None,
     min_keyword_matches: int = 2,
+    idea_text: str = "",
+    icp_category: str = "",
+    return_metadata: bool = False,
 ):
     """
     Run a keyword scan for the specified duration.
@@ -356,7 +434,16 @@ def run_keyword_scan(
             time.sleep(2.5)
 
     # ── Phase 2: Subreddit-specific searches ──
-    selected_subs = _select_subreddits(keywords, forced_subreddits=forced_subreddits)
+    try:
+        selected_subs = _select_subreddits(
+            keywords,
+            forced_subreddits=forced_subreddits,
+            idea_text=idea_text,
+        )
+    except TypeError:
+        # Preserve compatibility with tests that monkeypatch _select_subreddits.
+        selected_subs = _select_subreddits(keywords, forced_subreddits=forced_subreddits)
+    selected_subs = filter_subreddits_by_icp(selected_subs, icp_category)
     if on_progress:
         on_progress(len(all_posts), f"Scanning {len(selected_subs)} subreddits...")
 
@@ -497,6 +584,22 @@ def run_keyword_scan(
 
     if on_progress:
         on_progress(len(all_posts), "Scan complete!")
+
+    if return_metadata:
+        subreddit_post_counts = Counter(
+            str(p.get("subreddit") or "").strip().lower().replace("r/", "").replace("/r/", "")
+            for p in all_posts
+            if str(p.get("subreddit") or "").strip()
+        )
+        return {
+            "posts": all_posts,
+            "selected_subreddits": [
+                str(sub).strip().lower().replace("r/", "").replace("/r/", "")
+                for sub in selected_subs
+                if str(sub).strip()
+            ],
+            "subreddit_post_counts": dict(sorted(subreddit_post_counts.items())),
+        }
 
     return all_posts
 

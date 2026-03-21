@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
 import {
     BarChart3, Bell, BookOpen, Compass, FileText,
     Lightbulb, Mail, Settings,
@@ -33,6 +34,11 @@ const monitorItems: DockNavItem[] = [
 
 const groups = [marketItems, validateItems, monitorItems];
 
+const ACTIVE_VALIDATION_ID_KEY = "activeValidationId";
+const ACTIVE_VALIDATION_IDEA_KEY = "activeValidationIdea";
+const COMPLETED_VALIDATION_ID_KEY = "completedValidationId";
+const VALIDATION_STORAGE_EVENT = "validation-storage";
+
 /* ─── Divider ────────────────────────────────────────────────── */
 
 function DockDivider() {
@@ -58,6 +64,70 @@ export function Dock({
     currentPath: string;
     alertCount: number;
 }) {
+    const [hasCompletedValidation, setHasCompletedValidation] = useState(false);
+
+    const emitValidationStorageChange = useCallback(() => {
+        if (typeof window === "undefined") return;
+        window.dispatchEvent(new Event(VALIDATION_STORAGE_EVENT));
+    }, []);
+
+    const syncValidationBadge = useCallback(() => {
+        if (typeof window === "undefined") return;
+        setHasCompletedValidation(Boolean(window.localStorage.getItem(COMPLETED_VALIDATION_ID_KEY)));
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+
+        const onStorageChange = () => syncValidationBadge();
+        syncValidationBadge();
+
+        window.addEventListener("storage", onStorageChange);
+        window.addEventListener(VALIDATION_STORAGE_EVENT, onStorageChange);
+        return () => {
+            window.removeEventListener("storage", onStorageChange);
+            window.removeEventListener(VALIDATION_STORAGE_EVENT, onStorageChange);
+        };
+    }, [syncValidationBadge]);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+
+        if (currentPath?.startsWith("/dashboard/validate")) {
+            window.localStorage.removeItem(COMPLETED_VALIDATION_ID_KEY);
+            emitValidationStorageChange();
+        }
+
+        const checkValidationStatus = async () => {
+            const activeValidationId = window.localStorage.getItem(ACTIVE_VALIDATION_ID_KEY);
+            if (!activeValidationId) return;
+
+            try {
+                const response = await fetch(`/api/validate/${activeValidationId}/status`, { cache: "no-store" });
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const status = data?.validation?.status;
+                if (status === "done") {
+                    window.localStorage.removeItem(ACTIVE_VALIDATION_ID_KEY);
+                    window.localStorage.removeItem(ACTIVE_VALIDATION_IDEA_KEY);
+                    window.localStorage.setItem(COMPLETED_VALIDATION_ID_KEY, activeValidationId);
+                    emitValidationStorageChange();
+                } else if (status === "failed" || status === "error") {
+                    window.localStorage.removeItem(ACTIVE_VALIDATION_ID_KEY);
+                    window.localStorage.removeItem(ACTIVE_VALIDATION_IDEA_KEY);
+                    emitValidationStorageChange();
+                }
+            } catch {
+                // Best-effort dock polling only.
+            }
+        };
+
+        void checkValidationStatus();
+        const interval = window.setInterval(checkValidationStatus, 10000);
+        return () => window.clearInterval(interval);
+    }, [currentPath, emitValidationStorageChange]);
+
     return (
         <div
             className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[1000] w-[calc(100vw-1rem)] max-w-[980px] overflow-x-auto"
@@ -83,10 +153,17 @@ export function Dock({
                                 : currentPath === item.path || currentPath?.startsWith(item.path + "/");
                             const Icon = item.icon;
                             const badgeCount = item.path === "/dashboard/alerts" ? alertCount : 0;
+                            const showValidationBadge = item.path === "/dashboard/validate" && hasCompletedValidation;
                             return (
                                 <Link
                                     key={item.path}
                                     href={item.path}
+                                    onClick={() => {
+                                        if (item.path === "/dashboard/validate" && typeof window !== "undefined") {
+                                            window.localStorage.removeItem(COMPLETED_VALIDATION_ID_KEY);
+                                            emitValidationStorageChange();
+                                        }
+                                    }}
                                     className={`relative flex flex-col items-center gap-[3px] px-4 py-2 rounded-xl min-w-[60px] transition-all duration-150 text-[10px] tracking-wider ${
                                         isActive ? "text-primary" : "text-muted-foreground hover:text-foreground"
                                     }`}
@@ -98,6 +175,9 @@ export function Dock({
                                             <span className="absolute -top-2 -right-2 min-w-[16px] h-[16px] px-1 rounded-full bg-primary text-primary-foreground text-[9px] font-mono flex items-center justify-center">
                                                 {badgeCount > 99 ? "99+" : badgeCount}
                                             </span>
+                                        )}
+                                        {showValidationBadge && (
+                                            <span className="absolute -top-1.5 -right-1.5 w-[10px] h-[10px] rounded-full bg-primary border border-background shadow-[0_0_8px_hsl(16_100%_50%)]" />
                                         )}
                                     </div>
                                     <span className="font-medium">{item.name}</span>
@@ -129,4 +209,3 @@ export function Dock({
         </div>
     );
 }
-

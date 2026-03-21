@@ -74,12 +74,18 @@ const BUTTON_STAGES = [
 
 /* ── Types ───────────────────────────────────────────── */
 
+const ACTIVE_VALIDATION_ID_KEY = "activeValidationId";
+const ACTIVE_VALIDATION_IDEA_KEY = "activeValidationIdea";
+const COMPLETED_VALIDATION_ID_KEY = "completedValidationId";
+const VALIDATION_STORAGE_EVENT = "validation-storage";
+
 type Validation = {
     id: string;
     idea_text: string;
     status: string;
     verdict: string;
     confidence: number;
+    created_at?: string;
     posts_found?: number;
     report: any;
 };
@@ -183,6 +189,8 @@ const ValidatePage = () => {
     const [history, setHistory] = useState<HistoryItem[]>([]);
     const [termExpanded, setTermExpanded] = useState(false);
     const [validationError, setValidationError] = useState<string | null>(null);
+    const [activeValidationWarning, setActiveValidationWarning] = useState<string | null>(null);
+    const [storedActiveValidationId, setStoredActiveValidationId] = useState<string | null>(null);
     const [terminalTick, setTerminalTick] = useState(0);
     const [logEntries, setLogEntries] = useState<LogEntry[]>([
         { time: "00:00", msg: "[SYS] AI Engine stand-by — enter an idea to begin.", type: "muted" },
@@ -196,6 +204,7 @@ const ValidatePage = () => {
     const scrapingStartedAtRef = useRef<number | null>(null);
     const startTimeRef = useRef<number>(0);
     const pollingFailureRef = useRef(0);
+    const resumeCheckedRef = useRef(false);
 
     const stopPolling = useCallback(() => {
         if (pollingRef.current) {
@@ -203,6 +212,45 @@ const ValidatePage = () => {
             pollingRef.current = null;
         }
     }, []);
+
+    const emitValidationStorageChange = useCallback(() => {
+        if (typeof window === "undefined") return;
+        window.dispatchEvent(new Event(VALIDATION_STORAGE_EVENT));
+    }, []);
+
+    const syncStoredValidationId = useCallback(() => {
+        if (typeof window === "undefined") return;
+        setStoredActiveValidationId(window.localStorage.getItem(ACTIVE_VALIDATION_ID_KEY));
+    }, []);
+
+    const persistActiveValidation = useCallback((validationId: string, ideaText: string) => {
+        if (typeof window === "undefined") return;
+        window.localStorage.setItem(ACTIVE_VALIDATION_ID_KEY, validationId);
+        window.localStorage.setItem(ACTIVE_VALIDATION_IDEA_KEY, ideaText);
+        window.localStorage.removeItem(COMPLETED_VALIDATION_ID_KEY);
+        setStoredActiveValidationId(validationId);
+        emitValidationStorageChange();
+    }, [emitValidationStorageChange]);
+
+    const clearStoredValidation = useCallback((clearCompleted = false) => {
+        if (typeof window === "undefined") return;
+        window.localStorage.removeItem(ACTIVE_VALIDATION_ID_KEY);
+        window.localStorage.removeItem(ACTIVE_VALIDATION_IDEA_KEY);
+        if (clearCompleted) {
+            window.localStorage.removeItem(COMPLETED_VALIDATION_ID_KEY);
+        }
+        setStoredActiveValidationId(null);
+        emitValidationStorageChange();
+    }, [emitValidationStorageChange]);
+
+    const markValidationCompleted = useCallback((validationId: string) => {
+        if (typeof window === "undefined") return;
+        window.localStorage.removeItem(ACTIVE_VALIDATION_ID_KEY);
+        window.localStorage.removeItem(ACTIVE_VALIDATION_IDEA_KEY);
+        window.localStorage.setItem(COMPLETED_VALIDATION_ID_KEY, validationId);
+        setStoredActiveValidationId(null);
+        emitValidationStorageChange();
+    }, [emitValidationStorageChange]);
 
     /* parsed report (safe) */
     const parsedReport =
@@ -346,6 +394,12 @@ const ValidatePage = () => {
                             stopPolling();
                             setIsValidating(false);
                             if (newStatus === "done") {
+                                markValidationCompleted(d.validation.id || jobId);
+                                setActiveValidationWarning(null);
+                            } else {
+                                clearStoredValidation();
+                            }
+                            if (newStatus === "done") {
                                 setValidationError(null);
                                 router.push(`/dashboard/reports/${d.validation.id || jobId}`);
                             } else {
@@ -379,7 +433,7 @@ const ValidatePage = () => {
                 // ✓ POLLING INTACT: polls /api/validate/[jobId]/status every 2000ms, stops when status === 'done' or 'error' (or 'failed')
             }, 2000);
         },
-        [appendLiveProgress, router, pushLog, stopPolling],
+        [appendLiveProgress, clearStoredValidation, markValidationCompleted, router, pushLog, stopPolling],
     );
 
     useEffect(() => {
@@ -387,6 +441,71 @@ const ValidatePage = () => {
             stopPolling();
         };
     }, [stopPolling]);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+        const sync = () => syncStoredValidationId();
+        sync();
+        window.localStorage.removeItem(COMPLETED_VALIDATION_ID_KEY);
+        emitValidationStorageChange();
+        window.addEventListener("storage", sync);
+        window.addEventListener(VALIDATION_STORAGE_EVENT, sync);
+        return () => {
+            window.removeEventListener("storage", sync);
+            window.removeEventListener(VALIDATION_STORAGE_EVENT, sync);
+        };
+    }, [emitValidationStorageChange, syncStoredValidationId]);
+
+    useEffect(() => {
+        if (typeof window === "undefined" || resumeCheckedRef.current) return;
+        resumeCheckedRef.current = true;
+
+        const savedId = window.localStorage.getItem(ACTIVE_VALIDATION_ID_KEY);
+        if (!savedId) return;
+
+        const savedIdea = window.localStorage.getItem(ACTIVE_VALIDATION_IDEA_KEY) || "";
+
+        void fetch(`/api/validate/${savedId}/status`)
+            .then(async (response) => {
+                if (!response.ok) {
+                    throw new Error("Could not reconnect to saved validation");
+                }
+                return response.json() as Promise<ValidationStatusResponse>;
+            })
+            .then((data) => {
+                const validation = data?.validation;
+                const status = validation?.status || "";
+                if (status && !["done", "failed", "error"].includes(status)) {
+                    if (savedIdea) {
+                        setIdea((currentIdea) => currentIdea || savedIdea);
+                    }
+                    setValidationError(null);
+                    setActiveValidationWarning("A validation is already running. Wait for it to finish or cancel it first.");
+                    setIsValidating(true);
+                    if (validation) {
+                        setActiveValidation(validation);
+                        startTimeRef.current = validation.created_at
+                            ? Date.parse(validation.created_at) || Date.now()
+                            : Date.now();
+                        lastStatusRef.current = validation.status;
+                        lastProgressIdRef.current = 0;
+                        setLogEntries([
+                            { time: "00:00", msg: `[SYS] Reconnected to validation ${savedId.slice(0, 8)}...`, type: "info" },
+                        ]);
+                        appendLiveProgress(validation.report);
+                    }
+                    startPolling(savedId);
+                    return;
+                }
+
+                clearStoredValidation();
+                setActiveValidationWarning(null);
+            })
+            .catch(() => {
+                clearStoredValidation();
+                setActiveValidationWarning(null);
+            });
+    }, [appendLiveProgress, clearStoredValidation, startPolling]);
 
     /* auto-scroll terminal */
     useEffect(() => {
@@ -404,10 +523,30 @@ const ValidatePage = () => {
     }, [isValidating]);
 
     /* ── Launch validation ──────────────────────────────── */
+    const handleCancelCurrentValidation = useCallback(() => {
+        stopPolling();
+        clearStoredValidation();
+        setActiveValidation(null);
+        setIsValidating(false);
+        setValidationError(null);
+        setActiveValidationWarning(null);
+        lastStatusRef.current = "";
+        lastProgressIdRef.current = 0;
+        scrapingStartedAtRef.current = null;
+        setLogEntries([
+            { time: "00:00", msg: "[SYS] Detached from background validation. You can start a new one now.", type: "muted" },
+        ]);
+    }, [clearStoredValidation, stopPolling]);
+
     const handleValidate = async () => {
         if (!idea.trim()) return;
+        if (typeof window !== "undefined" && window.localStorage.getItem(ACTIVE_VALIDATION_ID_KEY)) {
+            setActiveValidationWarning("A validation is already running. Wait for it to finish or cancel it first.");
+            return;
+        }
         setIsValidating(true);
         setValidationError(null);
+        setActiveValidationWarning(null);
         setActiveValidation(null);
         lastStatusRef.current = "";
         lastProgressIdRef.current = 0;
@@ -434,9 +573,11 @@ const ValidatePage = () => {
             }
             const jobId = d.job_id || d.validationId;
             if (jobId) {
-                startPolling(jobId);
+                const validationId = d.validationId || jobId;
+                persistActiveValidation(validationId, idea.trim());
+                startPolling(validationId);
                 setActiveValidation({
-                    id: d.validationId || jobId,
+                    id: validationId,
                     idea_text: idea.trim(),
                     status: "starting",
                     verdict: "",
@@ -526,6 +667,24 @@ const ValidatePage = () => {
                 </div>
             )}
 
+            {activeValidationWarning && (
+                <div className="mb-4 bento-cell p-4 rounded-[14px] border border-primary/20 bg-primary/5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                    <div>
+                        <div className="text-[11px] font-mono uppercase tracking-[0.12em] text-primary mb-1">Validation In Progress</div>
+                        <p className="text-sm text-foreground/85">{activeValidationWarning}</p>
+                        <p className="text-[11px] text-muted-foreground mt-1">
+                            Canceling here only clears this page state. The background worker keeps running.
+                        </p>
+                    </div>
+                    <button
+                        onClick={handleCancelCurrentValidation}
+                        className="px-4 py-2 rounded-lg text-xs font-mono bg-white/5 border border-white/10 text-foreground hover:bg-white/10 transition-colors"
+                    >
+                        Cancel current validation
+                    </button>
+                </div>
+            )}
+
             {/* ── Bento Grid ─────────────────────────────────── */}
             <div className="grid grid-cols-12 gap-2.5" style={{ gridAutoRows: "80px" }}>
 
@@ -554,7 +713,7 @@ const ValidatePage = () => {
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.1 }}
                     onClick={handleValidate}
-                    disabled={isValidating || !idea.trim()}
+                    disabled={isValidating || !idea.trim() || Boolean(storedActiveValidationId)}
                     whileHover={{ scale: 1.01, y: -2 }}
                     whileTap={{ scale: 0.98 }}
                     className="col-span-4 row-span-2 rounded-[14px] flex flex-col items-center justify-center gap-2 cursor-pointer transition-all disabled:opacity-40 disabled:cursor-not-allowed"
