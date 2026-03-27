@@ -1,6 +1,14 @@
 name: 24/7 Market Intelligence Scraper
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/scraper.yml"
+      - "scraper_job.py"
+      - "engine/**"
+      - "migrations/**"
   schedule:
     - cron: "0 5 * * *"
   workflow_dispatch:
