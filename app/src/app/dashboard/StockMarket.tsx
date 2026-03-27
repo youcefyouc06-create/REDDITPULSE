@@ -108,6 +108,24 @@ const SIGNAL_LEVEL_MAP: Record<OpportunitySignalContract["support_level"], { lab
     },
 };
 
+function formatSourceName(platform?: string | null) {
+    const value = String(platform || "").toLowerCase();
+    if (value === "reddit") return "Reddit";
+    if (value === "hackernews") return "Hacker News";
+    if (value === "producthunt") return "Product Hunt";
+    if (value === "indiehackers") return "Indie Hackers";
+    return platform || "Unknown";
+}
+
+function formatSourceShort(platform?: string | null) {
+    const value = String(platform || "").toLowerCase();
+    if (value === "reddit") return "R";
+    if (value === "hackernews") return "HN";
+    if (value === "producthunt") return "PH";
+    if (value === "indiehackers") return "IH";
+    return String(platform || "?").slice(0, 2).toUpperCase();
+}
+
 function ChangeDisplay({ value, prefix = "" }: { value: number; prefix?: string }) {
     const color = value > 0 ? "#22c55e" : value < 0 ? "#ef4444" : "#64748b";
     const bg = value > 0 ? "rgba(34,197,94,0.1)" : value < 0 ? "rgba(239,68,68,0.1)" : "rgba(100,116,139,0.1)";
@@ -193,17 +211,23 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
             color: conf.color,
             background: "rgba(148,163,184,0.12)",
         };
+    const signalBadgeLabel = signalContract?.label || signalTone.label;
     const representativePosts = rankOpportunityRepresentativePosts(idea.top_posts || []).slice(0, 3);
     const signalPanelTitle =
         signalContract?.support_level === "evidence_backed"
-            ? "Buyer pain signals"
+            ? "Why this looks real"
             : signalContract?.support_level === "supporting_context"
-                ? "Supporting signals"
-                : "Context signals";
+                ? "Why this is promising but not proven yet"
+                : signalContract?.hn_launch_heavy
+                    ? "Why this is mostly builder chatter"
+                    : "Why this is still early";
     const scoreBreakdown = normalizeScoreBreakdown(idea);
     const hasThinDataWarning =
         ["LOW", "INSUFFICIENT"].includes(String(idea.confidence_level || "").toUpperCase())
         || signalContract?.support_level === "hypothesis";
+    const sourceSummary = (idea.sources || [])
+        .map((source) => `${formatSourceName(source.platform)} ${source.count}`)
+        .join(" · ");
 
     const handleClick = (e: React.MouseEvent) => {
         e.preventDefault();
@@ -284,7 +308,7 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                             borderRadius: 999,
                             fontWeight: 700,
                         }}>
-                            {signalTone.label}
+                            {signalBadgeLabel}
                         </span>
                     </div>
                 </div>
@@ -305,6 +329,9 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                     </div>
                     <div style={{ marginTop: 4, padding: "0 8px" }}>
                         <ScoreBar score={idea.current_score} color={scoreColor} />
+                    </div>
+                    <div style={{ marginTop: 5, fontSize: 9, color: "#64748b", lineHeight: 1.3 }}>
+                        evidence score
                     </div>
                     {hasThinDataWarning && (
                         <div style={{ marginTop: 6, fontSize: 9, color: "#fbbf24", lineHeight: 1.4 }}>
@@ -342,11 +369,11 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                         "rgba(79,70,229,0.15)",
                             color: s === "reddit" ? "#ff4500" :
                                 s === "hackernews" ? "#ff6600" :
-                                    s === "producthunt" ? "#da552f" :
+                                s === "producthunt" ? "#da552f" :
                                         "#4f46e5",
                             fontWeight: 600, textTransform: "uppercase",
-                        }}>
-                            {s === "reddit" ? "R" : s === "hackernews" ? "HN" : s === "producthunt" ? "PH" : "IH"}
+                        }} title={`${formatSourceName(s)}: ${source.count} posts`}>
+                            {formatSourceShort(s)}{Math.max(0, Number(source.count || 0))}
                         </span>
                     )})}
                 </div>
@@ -391,12 +418,40 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                         <span style={{ color: "#94a3b8", fontSize: 10 }}>
                                             {signalContract?.summary || "Representative evidence ranked by buyer-native proof first."}
                                         </span>
+                                        {signalContract?.reasons && signalContract.reasons.length > 0 && (
+                                            <div style={{
+                                                display: "flex",
+                                                flexWrap: "wrap",
+                                                gap: 6,
+                                                marginTop: 6,
+                                            }}>
+                                                {signalContract.reasons.slice(0, 3).map((reason) => (
+                                                    <span
+                                                        key={`${idea.slug}-${reason}`}
+                                                        style={{
+                                                            fontSize: 9,
+                                                            color: "#cbd5e1",
+                                                            background: "rgba(255,255,255,0.04)",
+                                                            border: "1px solid rgba(255,255,255,0.06)",
+                                                            borderRadius: 999,
+                                                            padding: "3px 7px",
+                                                        }}
+                                                    >
+                                                        {reason}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                     {idea.top_posts && idea.top_posts.length > 0 ? (
                                         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                                             {representativePosts.map((post, index) => {
                                                 const postSupport = getOpportunityPostSupportLevel(post);
                                                 const postTone = SIGNAL_LEVEL_MAP[postSupport];
+                                                const postLabel =
+                                                    postSupport === "hypothesis" && post.signal_kind === "launch_discussion"
+                                                        ? "Builder / launch chatter"
+                                                        : postTone.label;
                                                 return (
                                                 <a
                                                     key={`${idea.slug}-post-${index}`}
@@ -430,11 +485,11 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                                                 color: postTone.color,
                                                                 fontWeight: 700,
                                                             }}>
-                                                                {postTone.label}
+                                                                {postLabel}
                                                             </span>
                                                             {post.signal_kind === "launch_discussion" && (
                                                                 <span style={{ fontSize: 9, color: "#fbbf24", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                                                                    launch/meta
+                                                                    not buyer pain
                                                                 </span>
                                                             )}
                                                         </div>
@@ -533,6 +588,12 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                         </div>
                                         <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.5 }}>
                                             {idea.post_count_total} total posts across {idea.source_count} {idea.source_count === 1 ? "source" : "sources"}.
+                                        </div>
+                                        <div style={{ fontSize: 11, color: "#94a3b8", lineHeight: 1.5 }}>
+                                            Source mix: {sourceSummary || "No source mix yet"}.
+                                        </div>
+                                        <div style={{ fontSize: 11, color: "#64748b", lineHeight: 1.55 }}>
+                                            The score is based on current evidence quality and momentum in this card, not a claim that this is the best business in the world.
                                         </div>
                                     </div>
                                 </div>
@@ -870,11 +931,25 @@ export default function StockMarketDashboard() {
 
             {/* Stats Row */}
             <div style={{ display: "flex", gap: 16, marginBottom: 24 }}>
-                <StatCard label="Ideas Tracked" value={ideas.length} icon={Eye} color="#f97316" />
+                <StatCard label="Ideas Tracked" value={ideas.length} icon={Eye} color="#f97316" subtitle="current board snapshot" />
                 <StatCard label="Rising" value={trendCounts.rising} icon={TrendingUp} color="#22c55e" subtitle="ideas trending up" />
                 <StatCard label="Falling" value={trendCounts.falling} icon={TrendingDown} color="#ef4444" subtitle="ideas losing steam" />
-                <StatCard label="Avg Score" value={avgScore.toFixed(0)} icon={Activity} color="#3b82f6" />
-                <StatCard label="Total Posts" value={totalPosts.toLocaleString()} icon={BarChart3} color="#8b5cf6" />
+                <StatCard label="Avg Score" value={avgScore.toFixed(0)} icon={Activity} color="#3b82f6" subtitle="visible card evidence score" />
+                <StatCard label="Total Posts" value={totalPosts.toLocaleString()} icon={BarChart3} color="#8b5cf6" subtitle="posts attached to visible cards" />
+            </div>
+
+            <div style={{
+                marginBottom: 18,
+                padding: "10px 14px",
+                borderRadius: 10,
+                background: "rgba(59,130,246,0.07)",
+                border: "1px solid rgba(59,130,246,0.14)",
+                color: "#bfdbfe",
+                fontSize: 12,
+                lineHeight: 1.55,
+            }}>
+                Board numbers reflect the current visible market cards, not every raw post the scraper has ever collected.
+                Scores measure current evidence strength plus momentum, so a score of 30 means "weak proof right now" rather than "bad idea forever."
             </div>
 
             {/* Tabs + Category Filter */}

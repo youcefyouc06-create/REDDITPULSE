@@ -502,6 +502,16 @@ For Windows development, run this once per day or create a Windows Task Schedule
 python C:\Users\PC\Desktop\youcef\A\RedditPulse\scraper_job.py
 ```
 
+### How to read the market board
+
+- `Ideas Tracked` is the current visible board snapshot, not the lifetime number of raw posts ever scraped.
+- `Total Posts` is the sum of posts attached to the cards currently visible on the board.
+- The market `score` is an evidence-and-momentum score for the current signal mix, not a universal verdict on whether an idea is good forever.
+- Signal labels mean:
+  - `Buyer pain signal`: there is direct buyer-native proof in the representative evidence.
+  - `Context signal`: there is some supporting proof, but the demand case is still thin or concentrated.
+  - `Builder-launch heavy` / `Exploratory signal`: the topic is interesting, but the visible evidence is still dominated by launch chatter, builder talk, or weak proof.
+
 ### Run a keyword scan
 
 ```bash
@@ -526,6 +536,9 @@ python enrich_idea.py invoice-automation --keywords "invoice,billing"
 
 - The Python engine runs as **child processes** spawned by Next.js API routes via `exec()`
 - The repo includes a GitHub Actions workflow at [`.github/workflows/scraper.yml`](./.github/workflows/scraper.yml)
+- The scraper now runs on both:
+  - the daily schedule (`0 5 * * *`)
+  - pushes to `main` that touch scraper-related files (`scraper_job.py`, `engine/**`, `migrations/**`, or the workflow itself)
 - The scraper is currently scheduled to run **every 24 hours** via GitHub Actions cron: `0 5 * * *`
 - On GitHub, add these Actions secrets before enabling the workflow: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `PROXY_LIST`, `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `GH_TOKEN`
 - The workflow runs `python scraper_job.py --mode=full --source=github_actions`
