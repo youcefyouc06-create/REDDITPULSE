@@ -1,8 +1,7 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
-import { createClient } from "@/lib/supabase-browser";
 import { Dock } from "./components/Dock";
 import { TopBar } from "./components/TopBar";
 import { FEATURE_FLAGS } from "@/lib/feature-flags";
@@ -17,19 +16,21 @@ export function DashboardLayout({
     userPlan: string;
 }) {
     const pathname = usePathname();
-    const supabase = useMemo(() => createClient(), []);
     const [ideaCount, setIdeaCount] = useState(0);
     const [postCount, setPostCount] = useState(0);
     const [modelCount, setModelCount] = useState(0);
     const [alertCount, setAlertCount] = useState(0);
 
     useEffect(() => {
-        fetch("/api/ideas?limit=1")
-            .then((r) => r.json())
-            .then((res) => {
-                setIdeaCount(res.total || 0);
-            })
-            .catch(() => {});
+        const refreshMarketSummary = () => {
+            fetch("/api/discover", { cache: "no-store" })
+                .then((r) => r.ok ? r.json() : Promise.reject(new Error("Failed to load market summary")))
+                .then((res) => {
+                    setIdeaCount(Number(res.ideaCount || 0));
+                    setPostCount(Number(res.trackedPostCount || 0));
+                })
+                .catch(() => {});
+        };
 
         fetch("/api/settings/ai")
             .then((r) => r.json())
@@ -46,25 +47,25 @@ export function DashboardLayout({
                 .then((res) => setAlertCount(res.unread_count || 0))
                 .catch(() => setAlertCount(0));
         };
+        const refreshWhenVisible = () => {
+            if (typeof document === "undefined" || document.visibilityState === "visible") {
+                refreshMarketSummary();
+                refreshAlerts();
+            }
+        };
+
+        refreshMarketSummary();
         refreshAlerts();
+        document.addEventListener("visibilitychange", refreshWhenVisible);
+        const marketInterval = setInterval(refreshMarketSummary, 60000);
         const alertInterval = FEATURE_FLAGS.ALERTS_ENABLED ? setInterval(refreshAlerts, 60000) : null;
 
-        supabase.from("posts").select("*", { count: "exact", head: true }).then(({ count }) => {
-            setPostCount(count || 0);
-        });
-
-        const channel = supabase
-            .channel("post-count")
-            .on("postgres_changes", { event: "INSERT", schema: "public", table: "posts" }, () => {
-                setPostCount((prev) => prev + 1);
-            })
-            .subscribe();
-
         return () => {
+            document.removeEventListener("visibilitychange", refreshWhenVisible);
+            clearInterval(marketInterval);
             if (alertInterval) clearInterval(alertInterval);
-            supabase.removeChannel(channel);
         };
-    }, [supabase]);
+    }, []);
 
     return (
         <div className="flex h-screen w-full relative selection:bg-primary/30 overflow-hidden">

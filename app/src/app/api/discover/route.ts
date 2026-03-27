@@ -92,16 +92,27 @@ export async function GET() {
 
         const latestRun = runs?.[0] || null;
 
-        // Get idea count
+        // Get current market snapshot counts used by the board.
         const { count } = await supabase
             .from("ideas")
-            .select("*", { count: "exact", head: true });
+            .select("*", { count: "exact", head: true })
+            .neq("confidence_level", "INSUFFICIENT");
+
+        const { data: ideaRows } = await supabase
+            .from("ideas")
+            .select("post_count_total")
+            .neq("confidence_level", "INSUFFICIENT");
+
+        const trackedPostCount = Array.isArray(ideaRows)
+            ? ideaRows.reduce((sum, row) => sum + Number(row.post_count_total || 0), 0)
+            : 0;
 
         return NextResponse.json({
             latestRun,
             ideaCount: count || 0,
+            trackedPostCount,
         });
     } catch {
-        return NextResponse.json({ latestRun: null, ideaCount: 0 });
+        return NextResponse.json({ latestRun: null, ideaCount: 0, trackedPostCount: 0 });
     }
 }

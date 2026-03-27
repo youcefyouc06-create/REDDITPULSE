@@ -413,10 +413,30 @@ const ValidatePage = () => {
 
     useEffect(() => {
         const prefillIdea = searchParams.get("idea");
-        if (prefillIdea && !idea) {
+        const prefillTarget = searchParams.get("target");
+        const prefillPain = searchParams.get("pain");
+        const prefillCompetitors = searchParams.get("competitors");
+        const prefillDepth = searchParams.get("depth");
+        if (prefillIdea && !idea.trim()) {
             setIdea(prefillIdea);
         }
-    }, [searchParams, idea]);
+        if (prefillTarget && !target.trim()) {
+            setTarget(prefillTarget);
+        }
+        if (prefillPain && !pain.trim()) {
+            setPain(prefillPain);
+        }
+        if (prefillCompetitors && !competitors.trim()) {
+            setCompetitors(prefillCompetitors);
+        }
+        if (
+            prefillDepth
+            && depth === DEFAULT_DEPTH
+            && VALIDATION_DEPTHS.some((option) => option.mode === prefillDepth)
+        ) {
+            setDepth(prefillDepth as ValidationDepth);
+        }
+    }, [searchParams, idea, target, pain, competitors, depth]);
 
     /* ── Push log entry on status change ─────────────────── */
     const pushLog = useCallback((status: string, validation: Validation) => {

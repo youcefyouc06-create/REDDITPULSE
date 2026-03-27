@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { LucideIcon } from "lucide-react";
@@ -199,6 +200,48 @@ function normalizeScoreBreakdown(idea: Idea): ScoreBreakdown | null {
     return hasAnyRaw || hasVisibleSignal ? breakdown : null;
 }
 
+function shouldShowIdeaOnBoard(idea: Idea, showEarlySignals: boolean) {
+    if (showEarlySignals) return true;
+    const confidence = String(idea.confidence_level || "").toUpperCase();
+    const supportLevel = idea.signal_contract?.support_level || "hypothesis";
+    return !["LOW", "INSUFFICIENT"].includes(confidence) && supportLevel !== "hypothesis";
+}
+
+function buildMarketValidationHref(
+    idea: Idea,
+    representativePosts: OpportunityTopPost[],
+    signalSummary?: string | null,
+    dominantPlatform?: string | null,
+) {
+    const params = new URLSearchParams();
+    const cleanTopic = decodeHtml(idea.topic).trim();
+    const uniqueCommunities = Array.from(new Set(
+        representativePosts
+            .map((post) => {
+                const subreddit = decodeHtml(post.subreddit);
+                return subreddit ? `r/${subreddit}` : formatSourceName(post.source);
+            })
+            .filter(Boolean),
+    )).slice(0, 3);
+
+    const target = uniqueCommunities.length > 0
+        ? `People active in ${uniqueCommunities.join(", ")}`
+        : dominantPlatform
+            ? `${formatSourceName(dominantPlatform)} users discussing ${cleanTopic}`
+            : `${decodeHtml(idea.category)} buyers evaluating ${cleanTopic}`;
+
+    const pain = signalSummary && signalSummary.trim()
+        ? signalSummary.trim()
+        : `People are discussing ${cleanTopic}, but the exact buyer pain still needs direct validation.`;
+
+    params.set("idea", cleanTopic);
+    params.set("target", target);
+    params.set("pain", pain);
+    params.set("depth", "deep");
+
+    return `/dashboard/validate?${params.toString()}`;
+}
+
 function DetailMetric({
     label,
     value,
@@ -296,13 +339,19 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
     const sourceSummary = (idea.sources || [])
         .map((source) => `${formatSourceName(source.platform)} ${source.count}`)
         .join(" · ");
-    const scoreMeters = [
-        { label: "Velocity", value: Number(scoreBreakdown?.velocity || 0), color: "#22c55e" },
-        { label: "Pain density", value: Number(scoreBreakdown?.pain_density || 0), color: "#f97316" },
-        { label: "Cross-platform", value: Number(scoreBreakdown?.cross_platform || 0), color: "#3b82f6" },
-        { label: "Engagement", value: Number(scoreBreakdown?.engagement || 0), color: "#a855f7" },
-        { label: "Volume", value: Number(scoreBreakdown?.volume || 0), color: "#eab308" },
-    ].filter((item) => Number.isFinite(item.value) && item.value > 0);
+    const validateHref = buildMarketValidationHref(
+        idea,
+        representativePosts,
+        signalContract?.summary || null,
+        signalContract?.dominant_platform || null,
+    );
+    const scoreMeters = scoreBreakdown ? [
+        { label: "Velocity", value: Number(scoreBreakdown.velocity ?? 0), color: "#22c55e" },
+        { label: "Pain density", value: Number(scoreBreakdown.pain_density ?? 0), color: "#f97316" },
+        { label: "Cross-platform", value: Number(scoreBreakdown.cross_platform ?? 0), color: "#3b82f6" },
+        { label: "Engagement", value: Number(scoreBreakdown.engagement ?? 0), color: "#a855f7" },
+        { label: "Volume", value: Number(scoreBreakdown.volume ?? 0), color: "#eab308" },
+    ].filter((item) => Number.isFinite(item.value)) : [];
 
     const handleClick = (e: React.MouseEvent) => {
         e.preventDefault();
@@ -536,6 +585,33 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                         hint={hasStructuredEvidence ? "Posts include structured evidence metadata." : "Representative posts still use older scrape metadata."}
                                         accent={hasStructuredEvidence ? "#22c55e" : "#f59e0b"}
                                     />
+                                    <Link
+                                        href={validateHref}
+                                        onClick={(event) => event.stopPropagation()}
+                                        style={{
+                                            display: "flex",
+                                            flexDirection: "column",
+                                            justifyContent: "space-between",
+                                            gap: 8,
+                                            padding: "12px 14px",
+                                            borderRadius: 10,
+                                            textDecoration: "none",
+                                            background: "linear-gradient(135deg, rgba(249,115,22,0.14), rgba(234,88,12,0.06))",
+                                            border: "1px solid rgba(249,115,22,0.18)",
+                                        }}
+                                    >
+                                        <div>
+                                            <div style={{ fontSize: 10, color: "#fdba74", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                                                Next move
+                                            </div>
+                                            <div style={{ fontSize: 17, fontWeight: 800, color: "#f8fafc", lineHeight: 1.1 }}>
+                                                Validate this idea
+                                            </div>
+                                        </div>
+                                        <div style={{ fontSize: 10, color: "#fed7aa", lineHeight: 1.5 }}>
+                                            Send this market signal into the Validate flow with topic, audience hint, and pain context prefilled.
+                                        </div>
+                                    </Link>
                                 </div>
 
                                 {!hasStructuredEvidence && (
@@ -816,7 +892,8 @@ function IdeaRow({ idea, rank }: { idea: Idea; rank: number }) {
                                             </div>
                                         )}
                                         <div style={{ fontSize: 11, color: "#64748b", lineHeight: 1.55 }}>
-                                            The score is based on current evidence quality and momentum in this card, not a claim that this is the best business in the world.
+                                            These bars are weighted ingredients, not numbers that add directly to the final score.
+                                            Final score = velocity 25% + pain density 25% + cross-platform proof 20% + engagement 20% + volume 10%.
                                         </div>
                                     </div>
                                 </div>
@@ -870,7 +947,7 @@ export default function StockMarketDashboard() {
     const [loading, setLoading] = useState(true);
     const [lastUpdated, setLastUpdated] = useState("");
     const [scanning, setScanning] = useState(false);
-    const [scanStatus, setScanStatus] = useState<{ latestRun: any; ideaCount: number } | null>(null);
+    const [scanStatus, setScanStatus] = useState<{ latestRun: any; ideaCount: number; trackedPostCount: number } | null>(null);
     const [scanError, setScanError] = useState("");
     const [trendCounts, setTrendCounts] = useState({ rising: 0, falling: 0 });
     const isDocumentVisible = () => typeof document === "undefined" || document.visibilityState === "visible";
@@ -904,14 +981,17 @@ export default function StockMarketDashboard() {
                 fallingRes.ok ? fallingRes.json() : Promise.resolve({ ideas: [] }),
             ]);
 
+            const risingIdeas = Array.isArray(risingData.ideas) ? risingData.ideas.filter((idea: Idea) => shouldShowIdeaOnBoard(idea, showEarlySignals)) : [];
+            const fallingIdeas = Array.isArray(fallingData.ideas) ? fallingData.ideas.filter((idea: Idea) => shouldShowIdeaOnBoard(idea, showEarlySignals)) : [];
+
             setTrendCounts({
-                rising: Array.isArray(risingData.ideas) ? risingData.ideas.length : 0,
-                falling: Array.isArray(fallingData.ideas) ? fallingData.ideas.length : 0,
+                rising: risingIdeas.length,
+                falling: fallingIdeas.length,
             });
         } catch {
             console.error("Failed to fetch trend counts");
         }
-    }, [category]);
+    }, [category, showEarlySignals]);
 
     const fetchScanStatus = useCallback(async () => {
         if (!isDocumentVisible()) return;
@@ -986,20 +1066,24 @@ export default function StockMarketDashboard() {
         };
     }, [scanning, fetchScanStatus]);
 
-    const filteredIdeas = useMemo(() => {
-        if (showEarlySignals) return ideas;
-        return ideas.filter((idea) => {
-            const confidence = String(idea.confidence_level || "").toUpperCase();
-            const supportLevel = idea.signal_contract?.support_level || "hypothesis";
-            return !["LOW", "INSUFFICIENT"].includes(confidence) && supportLevel !== "hypothesis";
-        });
-    }, [ideas, showEarlySignals]);
+    const filteredIdeas = useMemo(() => ideas.filter((idea) => shouldShowIdeaOnBoard(idea, showEarlySignals)), [ideas, showEarlySignals]);
 
     const usingFallbackMarketFeed = !showEarlySignals && filteredIdeas.length === 0 && ideas.length > 0;
     const visibleIdeas = usingFallbackMarketFeed ? ideas : filteredIdeas;
     const hiddenEarlyCount = usingFallbackMarketFeed ? 0 : Math.max(0, ideas.length - visibleIdeas.length);
+    const trackedIdeaCount = Math.max(scanStatus?.ideaCount || 0, ideas.length);
+    const snapshotIdeaCount = ideas.length;
+    const visibleIdeaCount = visibleIdeas.length;
     const avgScore = visibleIdeas.length > 0 ? visibleIdeas.reduce((a, b) => a + b.current_score, 0) / visibleIdeas.length : 0;
-    const totalPosts = visibleIdeas.reduce((a, b) => a + b.post_count_total, 0);
+    const snapshotPostCount = ideas.reduce((a, b) => a + b.post_count_total, 0);
+    const visiblePostCount = visibleIdeas.reduce((a, b) => a + b.post_count_total, 0);
+    const trackedPostCount = Math.max(scanStatus?.trackedPostCount || 0, snapshotPostCount);
+    const ideasTrackedSubtitle = visibleIdeaCount === snapshotIdeaCount
+        ? `${visibleIdeaCount} visible in this view`
+        : `${snapshotIdeaCount} in this view · ${visibleIdeaCount} visible`;
+    const postsTrackedSubtitle = visiblePostCount === snapshotPostCount
+        ? `${visiblePostCount.toLocaleString()} in this view`
+        : `${snapshotPostCount.toLocaleString()} in this view · ${visiblePostCount.toLocaleString()} visible`;
 
     return (
         <div style={{ padding: "24px 32px", maxWidth: 1400, margin: "0 auto" }}>
@@ -1025,7 +1109,7 @@ export default function StockMarketDashboard() {
                             padding: "4px 10px", borderRadius: 6,
                         }}>
                             <Activity style={{ width: 11, height: 11 }} />
-                            {scanStatus.ideaCount} ideas tracked
+                            {scanStatus.ideaCount} stored market ideas
                         </span>
                     )}
 
@@ -1155,11 +1239,11 @@ export default function StockMarketDashboard() {
 
             {/* Stats Row */}
             <div style={{ display: "flex", gap: 16, marginBottom: 24 }}>
-                <StatCard label="Ideas Tracked" value={ideas.length} icon={Eye} color="#f97316" subtitle="current board snapshot" />
+                <StatCard label="Ideas Tracked" value={trackedIdeaCount} icon={Eye} color="#f97316" subtitle={ideasTrackedSubtitle} />
                 <StatCard label="Rising" value={trendCounts.rising} icon={TrendingUp} color="#22c55e" subtitle="ideas trending up" />
                 <StatCard label="Falling" value={trendCounts.falling} icon={TrendingDown} color="#ef4444" subtitle="ideas losing steam" />
-                <StatCard label="Avg Score" value={avgScore.toFixed(0)} icon={Activity} color="#3b82f6" subtitle="visible card evidence score" />
-                <StatCard label="Total Posts" value={totalPosts.toLocaleString()} icon={BarChart3} color="#8b5cf6" subtitle="posts attached to visible cards" />
+                <StatCard label="Avg Score" value={avgScore.toFixed(0)} icon={Activity} color="#3b82f6" subtitle={`${visibleIdeaCount} visible card${visibleIdeaCount === 1 ? "" : "s"} on the board`} />
+                <StatCard label="Total Posts" value={trackedPostCount.toLocaleString()} icon={BarChart3} color="#8b5cf6" subtitle={postsTrackedSubtitle} />
             </div>
 
             <div style={{
@@ -1172,7 +1256,7 @@ export default function StockMarketDashboard() {
                 fontSize: 12,
                 lineHeight: 1.55,
             }}>
-                Board numbers reflect the current visible market cards, not every raw post the scraper has ever collected.
+                The market page has three layers: stored market ideas, ideas in the current tab/category view, and the higher-quality cards currently visible on the board.
                 Scores measure current evidence strength plus momentum, so a score of 30 means "weak proof right now" rather than "bad idea forever."
             </div>
 
@@ -1255,7 +1339,7 @@ export default function StockMarketDashboard() {
                     fontSize: 12,
                     lineHeight: 1.5,
                 }}>
-                    Showing stronger market signals first. {hiddenEarlyCount} lower-confidence or context-only idea{hiddenEarlyCount === 1 ? "" : "s"} hidden until you reveal the full market feed.
+                    Showing {visibleIdeaCount} of {snapshotIdeaCount} ideas in this view. {hiddenEarlyCount} lower-confidence or context-only idea{hiddenEarlyCount === 1 ? "" : "s"} hidden until you reveal the full market feed.
                 </div>
             )}
 
