@@ -1065,7 +1065,13 @@ export default function StockMarketDashboard() {
     const [loading, setLoading] = useState(true);
     const [lastUpdated, setLastUpdated] = useState("");
     const [scanning, setScanning] = useState(false);
-    const [scanStatus, setScanStatus] = useState<{ latestRun: any; ideaCount: number; trackedPostCount: number } | null>(null);
+    const [scanStatus, setScanStatus] = useState<{
+        latestRun: any;
+        ideaCount: number;
+        trackedPostCount: number;
+        archiveIdeaCount: number;
+        archivePostCount: number;
+    } | null>(null);
     const [scanError, setScanError] = useState("");
     const [trendCounts, setTrendCounts] = useState({ rising: 0, falling: 0 });
     const isDocumentVisible = () => typeof document === "undefined" || document.visibilityState === "visible";
@@ -1189,19 +1195,17 @@ export default function StockMarketDashboard() {
     const usingFallbackMarketFeed = !showEarlySignals && filteredIdeas.length === 0 && ideas.length > 0;
     const visibleIdeas = usingFallbackMarketFeed ? ideas : filteredIdeas;
     const hiddenEarlyCount = usingFallbackMarketFeed ? 0 : Math.max(0, ideas.length - visibleIdeas.length);
-    const trackedIdeaCount = Math.max(scanStatus?.ideaCount || 0, ideas.length);
+    const activeIdeaCount = Math.max(scanStatus?.ideaCount || 0, ideas.length);
+    const archiveIdeaCount = Math.max(scanStatus?.archiveIdeaCount || 0, activeIdeaCount);
     const snapshotIdeaCount = ideas.length;
     const visibleIdeaCount = visibleIdeas.length;
     const avgScore = visibleIdeas.length > 0 ? visibleIdeas.reduce((a, b) => a + b.current_score, 0) / visibleIdeas.length : 0;
     const snapshotPostCount = ideas.reduce((a, b) => a + b.post_count_total, 0);
     const visiblePostCount = visibleIdeas.reduce((a, b) => a + b.post_count_total, 0);
-    const trackedPostCount = Math.max(scanStatus?.trackedPostCount || 0, snapshotPostCount);
-    const ideasTrackedSubtitle = visibleIdeaCount === snapshotIdeaCount
-        ? `${visibleIdeaCount} visible in this view`
-        : `${snapshotIdeaCount} in this view · ${visibleIdeaCount} visible`;
-    const postsTrackedSubtitle = visiblePostCount === snapshotPostCount
-        ? `${visiblePostCount.toLocaleString()} in this view`
-        : `${snapshotPostCount.toLocaleString()} in this view · ${visiblePostCount.toLocaleString()} visible`;
+    const activePostCount = Math.max(scanStatus?.trackedPostCount || 0, snapshotPostCount);
+    const archivePostCount = Math.max(scanStatus?.archivePostCount || 0, activePostCount);
+    const ideasTrackedSubtitle = `${activeIdeaCount} active in the current market`;
+    const postsTrackedSubtitle = `${activePostCount.toLocaleString()} active posts in the current market`;
 
     return (
         <div style={{ padding: "24px 32px", maxWidth: 1400, margin: "0 auto" }}>
@@ -1220,14 +1224,14 @@ export default function StockMarketDashboard() {
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                     {/* Scan Status Badge */}
-                    {scanStatus && scanStatus.ideaCount > 0 && (
+                    {scanStatus && (scanStatus.archiveIdeaCount > 0 || scanStatus.ideaCount > 0) && (
                         <span style={{
                             fontSize: 11, color: "#64748b", display: "flex",
                             alignItems: "center", gap: 4, background: "rgba(255,255,255,0.03)",
                             padding: "4px 10px", borderRadius: 6,
                         }}>
                             <Activity style={{ width: 11, height: 11 }} />
-                            {scanStatus.ideaCount} stored market ideas
+                            {(scanStatus.archiveIdeaCount || scanStatus.ideaCount).toLocaleString()} ideas discovered
                         </span>
                     )}
 
@@ -1357,11 +1361,11 @@ export default function StockMarketDashboard() {
 
             {/* Stats Row */}
             <div style={{ display: "flex", gap: 16, marginBottom: 24 }}>
-                <StatCard label="Ideas Tracked" value={trackedIdeaCount} icon={Eye} color="#f97316" subtitle={ideasTrackedSubtitle} />
+                <StatCard label="Ideas Discovered" value={archiveIdeaCount} icon={Eye} color="#f97316" subtitle={ideasTrackedSubtitle} />
                 <StatCard label="Rising" value={trendCounts.rising} icon={TrendingUp} color="#22c55e" subtitle="ideas trending up" />
                 <StatCard label="Falling" value={trendCounts.falling} icon={TrendingDown} color="#ef4444" subtitle="ideas losing steam" />
                 <StatCard label="Avg Score" value={avgScore.toFixed(0)} icon={Activity} color="#3b82f6" subtitle={`${visibleIdeaCount} visible card${visibleIdeaCount === 1 ? "" : "s"} on the board`} />
-                <StatCard label="Total Posts" value={trackedPostCount.toLocaleString()} icon={BarChart3} color="#8b5cf6" subtitle={postsTrackedSubtitle} />
+                <StatCard label="Posts Archived" value={archivePostCount.toLocaleString()} icon={BarChart3} color="#8b5cf6" subtitle={postsTrackedSubtitle} />
             </div>
 
             <div style={{
@@ -1374,8 +1378,8 @@ export default function StockMarketDashboard() {
                 fontSize: 12,
                 lineHeight: 1.55,
             }}>
-                The market page has three layers: stored market ideas, ideas in the current tab/category view, and the higher-quality cards currently visible on the board.
-                Scores measure current evidence strength plus momentum, so a score of 30 means "weak proof right now" rather than "bad idea forever."
+                The market page now shows both archive scale and live market evidence.
+                "Ideas discovered" and "Posts archived" are cumulative archive totals, while the board score still reflects current evidence strength plus momentum.
             </div>
 
             {/* Tabs + Category Filter */}

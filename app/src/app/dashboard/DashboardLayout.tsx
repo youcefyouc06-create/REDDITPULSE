@@ -26,8 +26,8 @@ export function DashboardLayout({
             fetch("/api/discover", { cache: "no-store" })
                 .then((r) => r.ok ? r.json() : Promise.reject(new Error("Failed to load market summary")))
                 .then((res) => {
-                    setIdeaCount(Number(res.ideaCount || 0));
-                    setPostCount(Number(res.trackedPostCount || 0));
+                    setIdeaCount(Number(res.archiveIdeaCount || res.ideaCount || 0));
+                    setPostCount(Number(res.archivePostCount || res.trackedPostCount || 0));
                 })
                 .catch(() => {});
         };

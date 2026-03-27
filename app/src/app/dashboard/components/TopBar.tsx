@@ -162,7 +162,7 @@ export function TopBar({
                 <div className="hidden h-3 w-px bg-border md:block" />
 
                 <span className="hidden text-[11px] font-mono text-muted-foreground md:inline">
-                    {ideaCount.toLocaleString()} ideas · {postCount.toLocaleString()} posts
+                    {ideaCount.toLocaleString()} ideas discovered · {postCount.toLocaleString()} posts archived
                 </span>
             </div>
 

@@ -92,7 +92,7 @@ export async function GET() {
 
         const latestRun = runs?.[0] || null;
 
-        // Get current market snapshot counts used by the board.
+        // Current active market ideas used by the board.
         const { count } = await supabase
             .from("ideas")
             .select("*", { count: "exact", head: true })
@@ -107,12 +107,29 @@ export async function GET() {
             ? ideaRows.reduce((sum, row) => sum + Number(row.post_count_total || 0), 0)
             : 0;
 
+        // Archive counters prove how much unique evidence has been collected over time.
+        const { count: archiveIdeaCount } = await supabase
+            .from("ideas")
+            .select("*", { count: "exact", head: true });
+
+        const { count: archivePostCount } = await supabase
+            .from("posts")
+            .select("*", { count: "exact", head: true });
+
         return NextResponse.json({
             latestRun,
             ideaCount: count || 0,
             trackedPostCount,
+            archiveIdeaCount: archiveIdeaCount || 0,
+            archivePostCount: archivePostCount || 0,
         });
     } catch {
-        return NextResponse.json({ latestRun: null, ideaCount: 0, trackedPostCount: 0 });
+        return NextResponse.json({
+            latestRun: null,
+            ideaCount: 0,
+            trackedPostCount: 0,
+            archiveIdeaCount: 0,
+            archivePostCount: 0,
+        });
     }
 }
